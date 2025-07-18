@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -56,66 +58,278 @@ type LogEntry struct {
 
 // Config holds the configuration for the logger
 type Config struct {
-	URL             string        // Elasticsearch endpoint URL
-	MaxRetries      int           // Maximum number of retry attempts
-	RetryDelay      time.Duration // Delay between retries
-	BatchSize       int           // Size of batch for bulk operations
-	FlushInterval   time.Duration // Interval to flush logs
-	HTTPTimeout     time.Duration // HTTP client timeout
-	MaxQueueSize    int           // Maximum queue size before dropping logs
-	EnableAsync     bool          // Enable asynchronous logging
-	ComponentName   string        // Default component name
-	BufferSize      int           // Buffer size for async channel
+	URL                string        // Elasticsearch endpoint URL
+	MaxRetries         int           // Maximum number of retry attempts
+	RetryDelay         time.Duration // Delay between retries
+	BatchSize          int           // Size of batch for bulk operations
+	FlushInterval      time.Duration // Interval to flush logs
+	HTTPTimeout        time.Duration // HTTP client timeout
+	MaxQueueSize       int           // Maximum queue size before dropping logs
+	EnableAsync        bool          // Enable asynchronous logging
+	ComponentName      string        // Default component name
+	BufferSize         int           // Buffer size for async channel
+	MaxConcurrentSends int           // Maximum concurrent HTTP requests
+	WorkerPoolSize     int           // Number of worker goroutines (shards)
 }
 
 // DefaultConfig returns a default configuration
 func DefaultConfig(elasticURL string) *Config {
 	return &Config{
-		URL:           elasticURL,
-		MaxRetries:    3,
-		RetryDelay:    time.Second,
-		BatchSize:     100,
-		FlushInterval: 10 * time.Second,
-		HTTPTimeout:   30 * time.Second,
-		MaxQueueSize:  10000,
-		EnableAsync:   true,
-		ComponentName: "default",
-		BufferSize:    1000,
+		URL:                elasticURL,
+		MaxRetries:         3,
+		RetryDelay:         time.Second,
+		BatchSize:          100,
+		FlushInterval:      10 * time.Second,
+		HTTPTimeout:        30 * time.Second,
+		MaxQueueSize:       10000,
+		EnableAsync:        true,
+		ComponentName:      "default",
+		BufferSize:         1000,
+		MaxConcurrentSends: 10,
+		WorkerPoolSize:     5,
 	}
 }
 
-// ElasticLogger represents the main logger instance
-type ElasticLogger struct {
-	config     *Config
-	client     *http.Client
-	queue      chan *LogEntry
-	batch      []*LogEntry
-	mu         sync.RWMutex
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	closed     bool
-	closeMu    sync.RWMutex
-	ticker     *time.Ticker
-	stats      *LoggerStats
-	errorsCh   chan error
-}
-
-// LoggerStats holds statistics about the logger
+// LoggerStats holds statistics about the logger using atomic operations
 type LoggerStats struct {
 	TotalLogs    int64
 	SuccessLogs  int64
 	FailedLogs   int64
 	DroppedLogs  int64
 	RetryCount   int64
-	mu           sync.RWMutex
+	ActiveSends  int64
 }
 
-// GetStats returns a copy of current logger statistics
+// GetStats returns a snapshot of current logger statistics
 func (s *LoggerStats) GetStats() LoggerStats {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return *s
+	return LoggerStats{
+		TotalLogs:    atomic.LoadInt64(&s.TotalLogs),
+		SuccessLogs:  atomic.LoadInt64(&s.SuccessLogs),
+		FailedLogs:   atomic.LoadInt64(&s.FailedLogs),
+		DroppedLogs:  atomic.LoadInt64(&s.DroppedLogs),
+		RetryCount:   atomic.LoadInt64(&s.RetryCount),
+		ActiveSends:  atomic.LoadInt64(&s.ActiveSends),
+	}
+}
+
+// batchJob represents a job to send a batch of log entries
+type batchJob struct {
+	entries []*LogEntry
+	retries int
+}
+
+// workerShard represents a single shard with its own batch and processing
+type workerShard struct {
+	id           int
+	queue        chan *LogEntry
+	batchJobs    chan *batchJob
+	currentBatch []*LogEntry
+	ticker       *time.Ticker
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	config       *Config
+	client       *http.Client
+	stats        *LoggerStats
+	semaphore    chan struct{}
+	errorsCh     chan error
+}
+
+// newWorkerShard creates a new worker shard
+func newWorkerShard(id int, config *Config, client *http.Client, stats *LoggerStats, semaphore chan struct{}, errorsCh chan error) *workerShard {
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	// Рассчитываем размер буфера для каждого воркера
+	workerBufferSize := config.BufferSize / config.WorkerPoolSize
+	if workerBufferSize < 10 {
+		workerBufferSize = 10
+	}
+	
+	shard := &workerShard{
+		id:           id,
+		queue:        make(chan *LogEntry, workerBufferSize),
+		batchJobs:    make(chan *batchJob, workerBufferSize/config.BatchSize+1),
+		currentBatch: make([]*LogEntry, 0, config.BatchSize),
+		ticker:       time.NewTicker(config.FlushInterval),
+		ctx:          ctx,
+		cancel:       cancel,
+		config:       config,
+		client:       client,
+		stats:        stats,
+		semaphore:    semaphore,
+		errorsCh:     errorsCh,
+	}
+	
+	// Запускаем горутины для этого шарда
+	shard.wg.Add(2)
+	go shard.batchProcessor()
+	go shard.sender()
+	
+	return shard
+}
+
+// batchProcessor обрабатывает входящие логи и формирует батчи
+func (ws *workerShard) batchProcessor() {
+	defer ws.wg.Done()
+	defer ws.ticker.Stop()
+	
+	for {
+		select {
+		case <-ws.ctx.Done():
+			// Отправляем оставшиеся логи
+			ws.flushCurrentBatch()
+			return
+			
+		case entry := <-ws.queue:
+			ws.currentBatch = append(ws.currentBatch, entry)
+			
+			if len(ws.currentBatch) >= ws.config.BatchSize {
+				ws.flushCurrentBatch()
+			}
+			
+		case <-ws.ticker.C:
+			if len(ws.currentBatch) > 0 {
+				ws.flushCurrentBatch()
+			}
+		}
+	}
+}
+
+// flushCurrentBatch отправляет текущий батч в канал заданий
+func (ws *workerShard) flushCurrentBatch() {
+	if len(ws.currentBatch) == 0 {
+		return
+	}
+	
+	batch := make([]*LogEntry, len(ws.currentBatch))
+	copy(batch, ws.currentBatch)
+	ws.currentBatch = ws.currentBatch[:0]
+	
+	job := &batchJob{
+		entries: batch,
+		retries: 0,
+	}
+	
+	select {
+	case ws.batchJobs <- job:
+	default:
+		// Канал заданий переполнен, отправляем напрямую
+		go ws.processBatchJob(job)
+	}
+}
+
+// sender обрабатывает задания отправки батчей
+func (ws *workerShard) sender() {
+	defer ws.wg.Done()
+	
+	for {
+		select {
+		case <-ws.ctx.Done():
+			return
+		case job := <-ws.batchJobs:
+			ws.processBatchJob(job)
+		}
+	}
+}
+
+// processBatchJob обрабатывает отдельную задачу отправки батча
+func (ws *workerShard) processBatchJob(job *batchJob) {
+	// Получаем семафор для ограничения concurrent sends
+	ws.semaphore <- struct{}{}
+	defer func() { <-ws.semaphore }()
+	
+	atomic.AddInt64(&ws.stats.ActiveSends, 1)
+	defer atomic.AddInt64(&ws.stats.ActiveSends, -1)
+	
+	err := ws.sendLogEntries(job.entries)
+	if err != nil {
+		// Если это не последняя попытка, отправляем на повтор
+		if job.retries < ws.config.MaxRetries {
+			job.retries++
+			atomic.AddInt64(&ws.stats.RetryCount, 1)
+			
+			// Задержка перед повтором
+			time.Sleep(ws.config.RetryDelay * time.Duration(job.retries))
+			
+			// Отправляем на повтор
+			select {
+			case ws.batchJobs <- job:
+			default:
+				// Канал заданий переполнен, отправляем напрямую
+				go ws.processBatchJob(job)
+			}
+			return
+		}
+		
+		// Отправляем ошибку в канал мониторинга
+		select {
+		case ws.errorsCh <- err:
+		default:
+			// Error channel переполнен, игнорируем
+		}
+	}
+}
+
+// sendLogEntries sends multiple log entries to Elasticsearch
+func (ws *workerShard) sendLogEntries(entries []*LogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	
+	data, err := json.Marshal(entries)
+	if err != nil {
+		atomic.AddInt64(&ws.stats.FailedLogs, int64(len(entries)))
+		return fmt.Errorf("failed to marshal log entries: %w", err)
+	}
+	
+	req, err := http.NewRequestWithContext(ws.ctx, "POST", ws.config.URL, bytes.NewReader(data))
+	if err != nil {
+		atomic.AddInt64(&ws.stats.FailedLogs, int64(len(entries)))
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "ElasticLogger/1.0")
+	
+	resp, err := ws.client.Do(req)
+	if err != nil {
+		atomic.AddInt64(&ws.stats.FailedLogs, int64(len(entries)))
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		atomic.AddInt64(&ws.stats.SuccessLogs, int64(len(entries)))
+		return nil
+	}
+	
+	body, _ := io.ReadAll(resp.Body)
+	atomic.AddInt64(&ws.stats.FailedLogs, int64(len(entries)))
+	return fmt.Errorf("elasticsearch returned status %d: %s", resp.StatusCode, string(body))
+}
+
+// flush отправляет все накопленные логи немедленно
+func (ws *workerShard) flush() {
+	if len(ws.currentBatch) > 0 {
+		ws.flushCurrentBatch()
+	}
+}
+
+// close закрывает воркер
+func (ws *workerShard) close() {
+	ws.cancel()
+	ws.wg.Wait()
+}
+
+// ElasticLogger represents the main logger instance
+type ElasticLogger struct {
+	config    *Config
+	client    *http.Client
+	shards    []*workerShard
+	closed    int32
+	stats     *LoggerStats
+	errorsCh  chan error
+	semaphore chan struct{}
 }
 
 // NewElasticLogger creates a new instance of ElasticLogger
@@ -123,12 +337,12 @@ func NewElasticLogger(config *Config) (*ElasticLogger, error) {
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
-
+	
 	if config.URL == "" {
 		return nil, fmt.Errorf("elasticsearch URL cannot be empty")
 	}
-
-	// Validate configuration
+	
+	// Validate and set defaults
 	if config.BatchSize <= 0 {
 		config.BatchSize = 100
 	}
@@ -138,29 +352,50 @@ func NewElasticLogger(config *Config) (*ElasticLogger, error) {
 	if config.BufferSize <= 0 {
 		config.BufferSize = 1000
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
+	if config.MaxConcurrentSends <= 0 {
+		config.MaxConcurrentSends = 10
+	}
+	if config.WorkerPoolSize <= 0 {
+		config.WorkerPoolSize = 5
+	}
+	
 	logger := &ElasticLogger{
-		config: config,
-		client: &http.Client{
-			Timeout: config.HTTPTimeout,
-		},
-		queue:    make(chan *LogEntry, config.BufferSize),
-		batch:    make([]*LogEntry, 0, config.BatchSize),
-		ctx:      ctx,
-		cancel:   cancel,
-		stats:    &LoggerStats{},
-		errorsCh: make(chan error, 100),
+		config:    config,
+		client:    &http.Client{Timeout: config.HTTPTimeout},
+		stats:     &LoggerStats{},
+		errorsCh:  make(chan error, 100),
+		semaphore: make(chan struct{}, config.MaxConcurrentSends),
 	}
-
+	
 	if config.EnableAsync {
-		logger.ticker = time.NewTicker(config.FlushInterval)
-		logger.wg.Add(1)
-		go logger.processLogs()
+		// Создаем воркеры (шарды)
+		logger.shards = make([]*workerShard, config.WorkerPoolSize)
+		for i := 0; i < config.WorkerPoolSize; i++ {
+			logger.shards[i] = newWorkerShard(i, config, logger.client, logger.stats, logger.semaphore, logger.errorsCh)
+		}
 	}
-
+	
 	return logger, nil
+}
+
+// hashString вычисляет хэш строки для выбора шарда
+func (el *ElasticLogger) hashString(s string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return h.Sum32()
+}
+
+// selectShard выбирает шард для записи лога
+func (el *ElasticLogger) selectShard(entry *LogEntry) *workerShard {
+	// Используем комбинацию Component и UserID для более равномерного распределения
+	key := entry.Component + entry.UserID
+	if key == "" {
+		key = entry.Component
+	}
+	
+	hash := el.hashString(key)
+	shardIndex := hash % uint32(len(el.shards))
+	return el.shards[shardIndex]
 }
 
 // LogOptions provides options for logging
@@ -183,23 +418,20 @@ func (el *ElasticLogger) Log(opts LogOptions) error {
 
 // LogWithContext logs an entry with context
 func (el *ElasticLogger) LogWithContext(ctx context.Context, opts LogOptions) error {
-	el.closeMu.RLock()
-	if el.closed {
-		el.closeMu.RUnlock()
+	if atomic.LoadInt32(&el.closed) == 1 {
 		return fmt.Errorf("logger is closed")
 	}
-	el.closeMu.RUnlock()
-
+	
 	// Set default component if not provided
 	if opts.Component == "" {
 		opts.Component = el.config.ComponentName
 	}
-
+	
 	// Set default type based on level
 	if opts.Type == "" {
 		opts.Type = opts.Level.String()
 	}
-
+	
 	entry := &LogEntry{
 		Component:     opts.Component,
 		Action:        opts.Action,
@@ -211,28 +443,63 @@ func (el *ElasticLogger) LogWithContext(ctx context.Context, opts LogOptions) er
 		Type:          opts.Type,
 		Data:          opts.Data,
 	}
-
-	el.stats.mu.Lock()
-	el.stats.TotalLogs++
-	el.stats.mu.Unlock()
-
+	
+	atomic.AddInt64(&el.stats.TotalLogs, 1)
+	
 	if el.config.EnableAsync {
+		// Выбираем шард для записи
+		shard := el.selectShard(entry)
+		
 		select {
-		case el.queue <- entry:
+		case shard.queue <- entry:
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 			// Queue is full, drop the log
-			el.stats.mu.Lock()
-			el.stats.DroppedLogs++
-			el.stats.mu.Unlock()
+			atomic.AddInt64(&el.stats.DroppedLogs, 1)
 			return fmt.Errorf("log queue is full, dropping log entry")
 		}
 	}
-
+	
 	// Synchronous logging
 	return el.sendLogEntry(entry)
+}
+
+// sendLogEntry sends a single log entry to Elasticsearch (for sync mode)
+func (el *ElasticLogger) sendLogEntry(entry *LogEntry) error {
+	entries := []*LogEntry{entry}
+	
+	data, err := json.Marshal(entries)
+	if err != nil {
+		atomic.AddInt64(&el.stats.FailedLogs, 1)
+		return fmt.Errorf("failed to marshal log entries: %w", err)
+	}
+	
+	req, err := http.NewRequest("POST", el.config.URL, bytes.NewReader(data))
+	if err != nil {
+		atomic.AddInt64(&el.stats.FailedLogs, 1)
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "ElasticLogger/1.0")
+	
+	resp, err := el.client.Do(req)
+	if err != nil {
+		atomic.AddInt64(&el.stats.FailedLogs, 1)
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		atomic.AddInt64(&el.stats.SuccessLogs, 1)
+		return nil
+	}
+	
+	body, _ := io.ReadAll(resp.Body)
+	atomic.AddInt64(&el.stats.FailedLogs, 1)
+	return fmt.Errorf("elasticsearch returned status %d: %s", resp.StatusCode, string(body))
 }
 
 // Convenience methods for different log levels
@@ -286,164 +553,34 @@ func (el *ElasticLogger) Fatal(component, action, message string, data interface
 	})
 }
 
-// processLogs processes logs asynchronously
-func (el *ElasticLogger) processLogs() {
-	defer el.wg.Done()
-	defer el.ticker.Stop()
-
-	for {
-		select {
-		case <-el.ctx.Done():
-			// Flush remaining logs before shutdown
-			el.flushBatch()
-			return
-
-		case entry := <-el.queue:
-			el.mu.Lock()
-			el.batch = append(el.batch, entry)
-			
-			if len(el.batch) >= el.config.BatchSize {
-				el.flushBatch()
-			}
-			el.mu.Unlock()
-
-		case <-el.ticker.C:
-			el.mu.Lock()
-			if len(el.batch) > 0 {
-				el.flushBatch()
-			}
-			el.mu.Unlock()
-		}
-	}
-}
-
-// flushBatch sends the current batch to Elasticsearch
-func (el *ElasticLogger) flushBatch() {
-	if len(el.batch) == 0 {
-		return
-	}
-
-	batch := make([]*LogEntry, len(el.batch))
-	copy(batch, el.batch)
-	el.batch = el.batch[:0] // Clear the batch
-
-	// Send batch in a separate goroutine to avoid blocking
-	go func(entries []*LogEntry) {
-		if err := el.sendLogEntries(entries); err != nil {
-			// Send error to error channel for monitoring
-			select {
-			case el.errorsCh <- err:
-			default:
-				// Error channel is full, drop the error
-			}
-		}
-	}(batch)
-}
-
-// sendLogEntry sends a single log entry to Elasticsearch
-func (el *ElasticLogger) sendLogEntry(entry *LogEntry) error {
-	return el.sendLogEntries([]*LogEntry{entry})
-}
-
-// sendLogEntries sends multiple log entries to Elasticsearch
-func (el *ElasticLogger) sendLogEntries(entries []*LogEntry) error {
-	if len(entries) == 0 {
-		return nil
-	}
-
-	data, err := json.Marshal(entries)
-	if err != nil {
-		el.stats.mu.Lock()
-		el.stats.FailedLogs += int64(len(entries))
-		el.stats.mu.Unlock()
-		return fmt.Errorf("failed to marshal log entries: %w", err)
-	}
-
-	var lastErr error
-	for attempt := 0; attempt <= el.config.MaxRetries; attempt++ {
-		if attempt > 0 {
-			time.Sleep(el.config.RetryDelay * time.Duration(attempt))
-			el.stats.mu.Lock()
-			el.stats.RetryCount++
-			el.stats.mu.Unlock()
-		}
-
-		req, err := http.NewRequestWithContext(el.ctx, "POST", el.config.URL, bytes.NewReader(data))
-		if err != nil {
-			lastErr = fmt.Errorf("failed to create request: %w", err)
-			continue
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "ElasticLogger/1.0")
-
-		resp, err := el.client.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to send request: %w", err)
-			continue
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			el.stats.mu.Lock()
-			el.stats.SuccessLogs += int64(len(entries))
-			el.stats.mu.Unlock()
-			return nil
-		}
-
-		lastErr = fmt.Errorf("elasticsearch returned status %d: %s", resp.StatusCode, string(body))
-		
-		// Don't retry on client errors (4xx)
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			break
-		}
-	}
-
-	el.stats.mu.Lock()
-	el.stats.FailedLogs += int64(len(entries))
-	el.stats.mu.Unlock()
-
-	return fmt.Errorf("failed to send log entries after %d attempts: %w", el.config.MaxRetries+1, lastErr)
-}
-
 // Flush forces all pending logs to be sent immediately
 func (el *ElasticLogger) Flush() error {
 	if !el.config.EnableAsync {
 		return nil
 	}
-
-	el.mu.Lock()
-	defer el.mu.Unlock()
-
-	if len(el.batch) > 0 {
-		batch := make([]*LogEntry, len(el.batch))
-		copy(batch, el.batch)
-		el.batch = el.batch[:0]
-		return el.sendLogEntries(batch)
+	
+	// Flush all shards
+	for _, shard := range el.shards {
+		shard.flush()
 	}
-
+	
 	return nil
 }
 
 // Close gracefully shuts down the logger
 func (el *ElasticLogger) Close() error {
-	el.closeMu.Lock()
-	if el.closed {
-		el.closeMu.Unlock()
-		return nil
+	if !atomic.CompareAndSwapInt32(&el.closed, 0, 1) {
+		return nil // Already closed
 	}
-	el.closed = true
-	el.closeMu.Unlock()
-
+	
 	if el.config.EnableAsync {
-		el.cancel()
-		el.wg.Wait()
+		// Закрываем все шарды
+		for _, shard := range el.shards {
+			shard.close()
+		}
 	}
-
-	// Flush any remaining logs
-	return el.Flush()
+	
+	return nil
 }
 
 // GetStats returns current logger statistics
@@ -467,7 +604,7 @@ func (el *ElasticLogger) LogError(err error, component, action string, data inte
 		"stack_line": line,
 		"data":       data,
 	}
-
+	
 	return el.Log(LogOptions{
 		Component: component,
 		Action:    action,
@@ -477,35 +614,80 @@ func (el *ElasticLogger) LogError(err error, component, action string, data inte
 	})
 }
 
-// Example usage and factory functions
+// GetActiveSends returns the number of currently active HTTP requests
+func (el *ElasticLogger) GetActiveSends() int64 {
+	return atomic.LoadInt64(&el.stats.ActiveSends)
+}
+
+// GetShardStats returns statistics for each shard
+func (el *ElasticLogger) GetShardStats() []map[string]interface{} {
+	if !el.config.EnableAsync {
+		return nil
+	}
+	
+	stats := make([]map[string]interface{}, len(el.shards))
+	for i, shard := range el.shards {
+		stats[i] = map[string]interface{}{
+			"shard_id":      shard.id,
+			"queue_length":  len(shard.queue),
+			"batch_length":  len(shard.currentBatch),
+			"jobs_pending":  len(shard.batchJobs),
+		}
+	}
+	return stats
+}
+
+// Factory functions for different environments
 func NewProductionLogger(elasticURL string) (*ElasticLogger, error) {
 	config := &Config{
-		URL:           elasticURL,
-		MaxRetries:    5,
-		RetryDelay:    2 * time.Second,
-		BatchSize:     200,
-		FlushInterval: 5 * time.Second,
-		HTTPTimeout:   60 * time.Second,
-		MaxQueueSize:  50000,
-		EnableAsync:   true,
-		ComponentName: "production",
-		BufferSize:    5000,
+		URL:                elasticURL,
+		MaxRetries:         5,
+		RetryDelay:         2 * time.Second,
+		BatchSize:          200,
+		FlushInterval:      5 * time.Second,
+		HTTPTimeout:        60 * time.Second,
+		MaxQueueSize:       50000,
+		EnableAsync:        true,
+		ComponentName:      "production",
+		BufferSize:         5000,
+		MaxConcurrentSends: 20,
+		WorkerPoolSize:     10,
 	}
 	return NewElasticLogger(config)
 }
 
 func NewDevelopmentLogger(elasticURL string) (*ElasticLogger, error) {
 	config := &Config{
-		URL:           elasticURL,
-		MaxRetries:    1,
-		RetryDelay:    500 * time.Millisecond,
-		BatchSize:     10,
-		FlushInterval: 1 * time.Second,
-		HTTPTimeout:   10 * time.Second,
-		MaxQueueSize:  1000,
-		EnableAsync:   false, // Synchronous for development
-		ComponentName: "development",
-		BufferSize:    100,
+		URL:                elasticURL,
+		MaxRetries:         1,
+		RetryDelay:         500 * time.Millisecond,
+		BatchSize:          10,
+		FlushInterval:      1 * time.Second,
+		HTTPTimeout:        10 * time.Second,
+		MaxQueueSize:       1000,
+		EnableAsync:        false,
+		ComponentName:      "development",
+		BufferSize:         100,
+		MaxConcurrentSends: 5,
+		WorkerPoolSize:     3,
+	}
+	return NewElasticLogger(config)
+}
+
+func NewHighLoadLogger(elasticURL string) (*ElasticLogger, error) {
+	config := &Config{
+		URL:                elasticURL,
+		MaxRetries:         3,
+		RetryDelay:         1 * time.Second,
+		BatchSize:          500,
+		FlushInterval:      2 * time.Second,
+		HTTPTimeout:        30 * time.Second,
+		MaxQueueSize:       100000,
+		EnableAsync:        true,
+		ComponentName:      "high-load",
+		BufferSize:         10000,
+		MaxConcurrentSends: 50,
+		WorkerPoolSize:     20,
 	}
 	return NewElasticLogger(config)
 }
