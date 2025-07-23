@@ -698,4 +698,174 @@ func (dp *DocxProcessor) getValue(data interface{}, path string) interface{} {
 	for _, part := range parts {
 		// Обработка массивов
 		if strings.Contains(part, "[") {
-			arrayName := part[:strings.Index(p
+			arrayName := part[:strings.Index(part, "[")]
+			indexStr := part[strings.Index(part, "[")+1 : strings.Index(part, "]")]
+			index, err := strconv.Atoi(indexStr)
+			if err != nil {
+				return nil
+			}
+
+			current = dp.getFieldValue(current, arrayName)
+			if current == nil {
+				return nil
+			}
+
+			arr := reflect.ValueOf(current)
+			if arr.Kind() != reflect.Slice || index >= arr.Len() {
+				return nil
+			}
+			current = arr.Index(index).Interface()
+		} else {
+			current = dp.getFieldValue(current, part)
+			if current == nil {
+				return nil
+			}
+		}
+	}
+
+	return current
+}
+
+// Получение значения поля
+func (dp *DocxProcessor) getFieldValue(data interface{}, field string) interface{} {
+	if data == nil {
+		return nil
+	}
+
+	v := reflect.ValueOf(data)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+
+	switch v.Kind() {
+	case reflect.Map:
+		mapValue := v.Interface().(map[string]interface{})
+		return mapValue[field]
+	case reflect.Struct:
+		fieldValue := v.FieldByName(field)
+		if !fieldValue.IsValid() {
+			return nil
+		}
+		return fieldValue.Interface()
+	}
+
+	return nil
+}
+
+// Проверка, является ли значение массивом
+func (dp *DocxProcessor) isArray(value interface{}) bool {
+	if value == nil {
+		return false
+	}
+	
+	v := reflect.ValueOf(value)
+	return v.Kind() == reflect.Slice
+}
+
+// Получение длины массива
+func (dp *DocxProcessor) getArrayLength(value interface{}) int {
+	if value == nil {
+		return 0
+	}
+	
+	v := reflect.ValueOf(value)
+	if v.Kind() != reflect.Slice {
+		return 0
+	}
+	
+	return v.Len()
+}
+
+// Форматирование значения
+func (dp *DocxProcessor) formatValue(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	
+	return fmt.Sprintf("%v", value)
+}
+
+// Сохранение документа
+func (dp *DocxProcessor) saveDocument(outputPath string) error {
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("ошибка создания выходного файла: %v", err)
+	}
+	defer file.Close()
+
+	zipWriter := zip.NewWriter(file)
+	defer zipWriter.Close()
+
+	// Записываем все файлы в новый архив
+	for filename, content := range dp.files {
+		writer, err := zipWriter.Create(filename)
+		if err != nil {
+			return fmt.Errorf("ошибка создания файла %s в архиве: %v", filename, err)
+		}
+
+		_, err = writer.Write(content)
+		if err != nil {
+			return fmt.Errorf("ошибка записи файла %s: %v", filename, err)
+		}
+	}
+
+	return nil
+}
+
+// Закрытие процессора
+func (dp *DocxProcessor) Close() error {
+	if dp.zipReader != nil {
+		return dp.zipReader.Close()
+	}
+	return nil
+}
+
+// Пример использования
+func main() {
+	// Пример JSON данных
+	jsonData := `{
+		"client": {
+			"Name": "ООО Компания",
+			"Address": "г. Москва, ул. Примерная, д. 1"
+		},
+		"items": [
+			{
+				"Name": "Товар 1",
+				"Types": [
+					{
+						"Name": "Тип A",
+						"Price": 1000
+					},
+					{
+						"Name": "Тип B", 
+						"Price": 1500
+					}
+				]
+			},
+			{
+				"Name": "Товар 2",
+				"Types": [
+					{
+						"Name": "Тип C",
+						"Price": 2000
+					}
+				]
+			}
+		]
+	}`
+
+	// Создаем процессор
+	processor, err := NewDocxProcessor("template.docx")
+	if err != nil {
+		log.Fatalf("Ошибка создания процессора: %v", err)
+	}
+	defer processor.Close()
+
+	// Обрабатываем документ
+	err = processor.Process(jsonData, "output.docx")
+	if err != nil {
+		log.Fatalf("Ошибка обработки документа: %v", err)
+	}
+
+	fmt.Println("Документ успешно обработан и сохранен как output.docx")
+}
