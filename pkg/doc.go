@@ -298,70 +298,95 @@ func (dp *DocxProcessor) debugPlaceholders(xmlContent string) {
 
 // Извлечение таблиц из XML
 func (dp *DocxProcessor) extractTables(xmlContent string) []string {
-	tableRegex := regexp.MustCompile(`<w:tbl[^>]*>.*?</w:tbl>`)
+	// Используем более точное регулярное выражение для поиска таблиц
+	tableRegex := regexp.MustCompile(`(?s)<w:tbl[^>]*>.*?</w:tbl>`)
 	return tableRegex.FindAllString(xmlContent, -1)
 }
 
 // Обработка таблицы
 func (dp *DocxProcessor) processTable(tableXML string, data interface{}) (string, error) {
+	fmt.Printf("=== ОБРАБОТКА ТАБЛИЦЫ ===\n")
+	fmt.Printf("Размер таблицы: %d символов\n", len(tableXML))
+	
 	// Сначала восстанавливаем разбитые плейсхолдеры в таблице
+	originalTable := tableXML
 	tableXML = dp.reconstructPlaceholders(tableXML)
 	
+	if originalTable != tableXML {
+		fmt.Println("Плейсхолдеры были восстановлены в таблице")
+	}
+	
 	// Находим все строки в таблице
-	rowRegex := regexp.MustCompile(`<w:tr[^>]*>.*?</w:tr>`)
+	rowRegex := regexp.MustCompile(`(?s)<w:tr[^>]*>.*?</w:tr>`)
 	rows := rowRegex.FindAllString(tableXML, -1)
+	
+	fmt.Printf("Найдено строк в таблице: %d\n", len(rows))
 	
 	if len(rows) == 0 {
 		return tableXML, nil
 	}
 
-	// Ищем плейсхолдеры в первой строке данных (обычно вторая строка после заголовка)
-	var templateRow string
-	var templateRowIndex int = -1
+	// Ищем плейсхолдеры во всех строках
+	var templateRows []TableRowInfo
+	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
 	
 	for i, row := range rows {
-		if strings.Contains(row, "{") {
-			templateRow = row
-			templateRowIndex = i
-			break
+		placeholders := placeholderRegex.FindAllStringSubmatch(row, -1)
+		if len(placeholders) > 0 {
+			fmt.Printf("Строка %d содержит %d плейсхолдеров: ", i, len(placeholders))
+			for _, p := range placeholders {
+				fmt.Printf("%s ", p[0])
+			}
+			fmt.Println()
+			
+			templateRows = append(templateRows, TableRowInfo{
+				Index:        i,
+				Content:      row,
+				Placeholders: placeholders,
+			})
 		}
 	}
 
-	if templateRowIndex == -1 {
-		// Нет плейсхолдеров в таблице, обрабатываем как обычный текст
-		placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
-		placeholders := placeholderRegex.FindAllStringSubmatch(tableXML, -1)
-		
-		result := tableXML
-		for _, match := range placeholders {
-			placeholder := match[0]
-			path := match[1]
-			value := dp.getValue(data, path)
-			result = strings.Replace(result, placeholder, dp.formatValue(value), -1)
-		}
-		return result, nil
+	if len(templateRows) == 0 {
+		fmt.Println("Плейсхолдеры в таблице не найдены")
+		return tableXML, nil
 	}
 
-	// Определяем массивы для размножения строк
-	arrays := dp.findArraysInRow(templateRow, data)
-	
-	if len(arrays) == 0 {
-		// Нет массивов, просто заменяем плейсхолдеры
-		processedRow := dp.replaceRowPlaceholders(templateRow, data, 0)
-		result := tableXML
-		result = strings.Replace(result, templateRow, processedRow, 1)
-		return result, nil
-	}
-
-	// Генерируем новые строки на основе массивов
-	newRows := dp.generateTableRows(templateRow, data, arrays)
-	
-	// Заменяем шаблонную строку на сгенерированные
+	// Обрабатываем каждую строку с плейсхолдерами
 	result := tableXML
-	allNewRows := strings.Join(newRows, "")
-	result = strings.Replace(result, templateRow, allNewRows, 1)
 	
+	// Обрабатываем строки в обратном порядке, чтобы не нарушить индексы
+	for i := len(templateRows) - 1; i >= 0; i-- {
+		templateRow := templateRows[i]
+		
+		// Определяем массивы для размножения строк
+		arrays := dp.findArraysInRow(templateRow.Content, data)
+		fmt.Printf("Найдено массивов в строке %d: %v\n", templateRow.Index, arrays)
+		
+		if len(arrays) == 0 {
+			// Нет массивов, просто заменяем плейсхолдеры
+			processedRow := dp.replaceRowPlaceholders(templateRow.Content, data, 0)
+			result = strings.Replace(result, templateRow.Content, processedRow, 1)
+		} else {
+			// Генерируем новые строки на основе массивов
+			newRows := dp.generateTableRows(templateRow.Content, data, arrays)
+			fmt.Printf("Сгенерировано строк: %d\n", len(newRows))
+			
+			// Заменяем шаблонную строку на сгенерированные
+			allNewRows := strings.Join(newRows, "")
+			result = strings.Replace(result, templateRow.Content, allNewRows, 1)
+		}
+	}
+	
+	fmt.Println("=== КОНЕЦ ОБРАБОТКИ ТАБЛИЦЫ ===\n")
 	return result, nil
+}
+
+// Структура для информации о строке таблицы
+type TableRowInfo struct {
+	Index        int
+	Content      string
+	Placeholders [][]string
 }
 
 // Поиск массивов в строке таблицы
@@ -407,24 +432,225 @@ func (dp *DocxProcessor) generateTableRows(templateRow string, data interface{},
 		return []string{dp.replaceRowPlaceholders(templateRow, data, 0)}
 	}
 
-	// Находим максимальную длину массива
-	maxLength := 0
-	for _, arrayPath := range arrays {
-		arrayValue := dp.getValue(data, arrayPath)
-		length := dp.getArrayLength(arrayValue)
-		if length > maxLength {
-			maxLength = length
-		}
-	}
+	fmt.Printf("Генерируем строки для массивов: %v\n", arrays)
 
-	// Генерируем строки
-	rows := make([]string, 0, maxLength)
-	for i := 0; i < maxLength; i++ {
-		newRow := dp.replaceRowPlaceholders(templateRow, data, i)
+	// Определяем стратегию генерации строк на основе структуры массивов
+	maxRows := dp.calculateMaxRows(data, arrays)
+	fmt.Printf("Максимальное количество строк: %d\n", maxRows)
+
+	rows := make([]string, 0, maxRows)
+	
+	// Генерируем строки с учетом вложенности массивов
+	for i := 0; i < maxRows; i++ {
+		newRow := dp.replaceRowPlaceholdersAdvanced(templateRow, data, arrays, i)
 		rows = append(rows, newRow)
 	}
 
 	return rows
+}
+
+// Продвинутая замена плейсхолдеров с учетом множественных массивов
+func (dp *DocxProcessor) replaceRowPlaceholdersAdvanced(rowXML string, data interface{}, arrays []string, globalIndex int) string {
+	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
+	
+	return placeholderRegex.ReplaceAllStringFunc(rowXML, func(match string) string {
+		path := strings.Trim(match, "{}")
+		
+		// Определяем индексы для каждого уровня массива
+		adjustedPath := dp.calculatePathIndices(path, data, arrays, globalIndex)
+		value := dp.getValue(data, adjustedPath)
+		
+		return dp.formatValue(value)
+	})
+}
+
+// Вычисление максимального количества строк с учетом вложенных массивов  
+func (dp *DocxProcessor) calculateMaxRows(data interface{}, arrays []string) int {
+	maxRows := 1
+	
+	// Группируем массивы по уровням вложенности
+	arrayLevels := make(map[string][]string)
+	
+	for _, arrayPath := range arrays {
+		level := dp.getArrayLevel(arrayPath)
+		arrayLevels[level] = append(arrayLevels[level], arrayPath)
+	}
+	
+	// Вычисляем общее количество строк
+	totalRows := 0
+	
+	// Если есть массив верхнего уровня (например, items)
+	topLevelArrays := dp.findTopLevelArrays(arrays)
+	
+	if len(topLevelArrays) > 0 {
+		for _, topArray := range topLevelArrays {
+			topArrayValue := dp.getValue(data, topArray)
+			topArrayLength := dp.getArrayLength(topArrayValue)
+			
+			// Для каждого элемента верхнего массива считаем вложенные
+			for i := 0; i < topArrayLength; i++ {
+				nestedRows := dp.calculateNestedRows(data, arrays, topArray, i)
+				totalRows += nestedRows
+			}
+		}
+		return totalRows
+	}
+	
+	// Если нет массивов верхнего уровня, берем максимальную длину
+	for _, arrayPath := range arrays {
+		arrayValue := dp.getValue(data, arrayPath)
+		length := dp.getArrayLength(arrayValue)
+		if length > maxRows {
+			maxRows = length
+		}
+	}
+	
+	return maxRows
+}
+
+// Поиск массивов верхнего уровня
+func (dp *DocxProcessor) findTopLevelArrays(arrays []string) []string {
+	var topLevel []string
+	
+	for _, arrayPath := range arrays {
+		parts := strings.Split(arrayPath, ".")
+		if len(parts) == 1 {
+			topLevel = append(topLevel, arrayPath)
+		}
+	}
+	
+	return topLevel
+}
+
+// Получение уровня массива
+func (dp *DocxProcessor) getArrayLevel(arrayPath string) string {
+	parts := strings.Split(arrayPath, ".")
+	if len(parts) == 1 {
+		return "level1"
+	} else if len(parts) == 2 {
+		return "level2"
+	}
+	return "level3+"
+}
+
+// Вычисление количества вложенных строк
+func (dp *DocxProcessor) calculateNestedRows(data interface{}, arrays []string, topArray string, topIndex int) int {
+	rows := 1
+	
+	// Ищем вложенные массивы для данного элемента верхнего массива
+	for _, arrayPath := range arrays {
+		if strings.HasPrefix(arrayPath, topArray+".") {
+			// Это вложенный массив
+			indexedPath := fmt.Sprintf("%s[%d].%s", topArray, topIndex, 
+				strings.TrimPrefix(arrayPath, topArray+"."))
+			
+			nestedValue := dp.getValue(data, indexedPath)
+			nestedLength := dp.getArrayLength(nestedValue)
+			
+			if nestedLength > rows {
+				rows = nestedLength
+			}
+		}
+	}
+	
+	return rows
+}
+
+// Вычисление индексов для пути с учетом множественных массивов
+func (dp *DocxProcessor) calculatePathIndices(path string, data interface{}, arrays []string, globalIndex int) string {
+	parts := strings.Split(path, ".")
+	result := make([]string, len(parts))
+	copy(result, parts)
+	
+	currentIndex := globalIndex
+	
+	// Проходим по частям пути и добавляем индексы где нужно
+	for i, part := range parts {
+		currentPath := strings.Join(parts[:i+1], ".")
+		
+		// Проверяем, является ли эта часть массивом
+		if dp.containsArray(arrays, currentPath) {
+			// Вычисляем правильный индекс для этого уровня
+			index := dp.calculateIndexForLevel(data, arrays, currentPath, currentIndex)
+			result[i] = fmt.Sprintf("%s[%d]", part, index)
+			
+			// Обновляем текущий индекс для следующих уровней
+			currentIndex = dp.adjustIndexForNextLevel(data, currentPath, index, currentIndex)
+		}
+	}
+	
+	return strings.Join(result, ".")
+}
+
+// Проверка, содержится ли путь в массивах
+func (dp *DocxProcessor) containsArray(arrays []string, path string) bool {
+	for _, arrayPath := range arrays {
+		if arrayPath == path {
+			return true
+		}
+	}
+	return false
+}
+
+// Вычисление индекса для уровня
+func (dp *DocxProcessor) calculateIndexForLevel(data interface{}, arrays []string, currentPath string, globalIndex int) int {
+	// Простая стратегия: для массивов верхнего уровня используем прямое деление
+	parts := strings.Split(currentPath, ".")
+	
+	if len(parts) == 1 {
+		// Массив верхнего уровня
+		return globalIndex / dp.getNestedMultiplier(data, arrays, currentPath)
+	} else {
+		// Вложенный массив
+		parentPath := strings.Join(parts[:len(parts)-1], ".")
+		return globalIndex % dp.getArrayLengthByPath(data, currentPath)
+	}
+}
+
+// Получение множителя для вложенных массивов
+func (dp *DocxProcessor) getNestedMultiplier(data interface{}, arrays []string, topArrayPath string) int {
+	multiplier := 1
+	
+	for _, arrayPath := range arrays {
+		if strings.HasPrefix(arrayPath, topArrayPath+".") && arrayPath != topArrayPath {
+			// Находим максимальную длину вложенного массива
+			maxLength := 0
+			topArray := dp.getValue(data, topArrayPath)
+			if topArray != nil {
+				topLength := dp.getArrayLength(topArray)
+				for i := 0; i < topLength; i++ {
+					nestedPath := fmt.Sprintf("%s[%d].%s", topArrayPath, i, 
+						strings.TrimPrefix(arrayPath, topArrayPath+"."))
+					nestedArray := dp.getValue(data, nestedPath)
+					length := dp.getArrayLength(nestedArray)
+					if length > maxLength {
+						maxLength = length
+					}
+				}
+			}
+			if maxLength > multiplier {
+				multiplier = maxLength
+			}
+		}
+	}
+	
+	return multiplier
+}
+
+// Получение длины массива по пути
+func (dp *DocxProcessor) getArrayLengthByPath(data interface{}, path string) int {
+	value := dp.getValue(data, path)
+	return dp.getArrayLength(value)
+}
+
+// Корректировка индекса для следующего уровня
+func (dp *DocxProcessor) adjustIndexForNextLevel(data interface{}, currentPath string, currentIndex int, globalIndex int) int {
+	// Возвращаем остаток для следующего уровня
+	arrayLength := dp.getArrayLengthByPath(data, currentPath)
+	if arrayLength > 0 {
+		return globalIndex % arrayLength
+	}
+	return 0
 }
 
 // Замена плейсхолдеров в строке
@@ -472,174 +698,4 @@ func (dp *DocxProcessor) getValue(data interface{}, path string) interface{} {
 	for _, part := range parts {
 		// Обработка массивов
 		if strings.Contains(part, "[") {
-			arrayName := part[:strings.Index(part, "[")]
-			indexStr := part[strings.Index(part, "[")+1 : strings.Index(part, "]")]
-			index, err := strconv.Atoi(indexStr)
-			if err != nil {
-				return nil
-			}
-
-			current = dp.getFieldValue(current, arrayName)
-			if current == nil {
-				return nil
-			}
-
-			arr := reflect.ValueOf(current)
-			if arr.Kind() != reflect.Slice || index >= arr.Len() {
-				return nil
-			}
-			current = arr.Index(index).Interface()
-		} else {
-			current = dp.getFieldValue(current, part)
-			if current == nil {
-				return nil
-			}
-		}
-	}
-
-	return current
-}
-
-// Получение значения поля
-func (dp *DocxProcessor) getFieldValue(data interface{}, field string) interface{} {
-	if data == nil {
-		return nil
-	}
-
-	v := reflect.ValueOf(data)
-	if v.Kind() == reflect.Ptr {
-		v = v.Elem()
-	}
-
-	switch v.Kind() {
-	case reflect.Map:
-		mapValue := v.Interface().(map[string]interface{})
-		return mapValue[field]
-	case reflect.Struct:
-		fieldValue := v.FieldByName(field)
-		if !fieldValue.IsValid() {
-			return nil
-		}
-		return fieldValue.Interface()
-	}
-
-	return nil
-}
-
-// Проверка, является ли значение массивом
-func (dp *DocxProcessor) isArray(value interface{}) bool {
-	if value == nil {
-		return false
-	}
-	
-	v := reflect.ValueOf(value)
-	return v.Kind() == reflect.Slice
-}
-
-// Получение длины массива
-func (dp *DocxProcessor) getArrayLength(value interface{}) int {
-	if value == nil {
-		return 0
-	}
-	
-	v := reflect.ValueOf(value)
-	if v.Kind() != reflect.Slice {
-		return 0
-	}
-	
-	return v.Len()
-}
-
-// Форматирование значения
-func (dp *DocxProcessor) formatValue(value interface{}) string {
-	if value == nil {
-		return ""
-	}
-	
-	return fmt.Sprintf("%v", value)
-}
-
-// Сохранение документа
-func (dp *DocxProcessor) saveDocument(outputPath string) error {
-	file, err := os.Create(outputPath)
-	if err != nil {
-		return fmt.Errorf("ошибка создания выходного файла: %v", err)
-	}
-	defer file.Close()
-
-	zipWriter := zip.NewWriter(file)
-	defer zipWriter.Close()
-
-	// Записываем все файлы в новый архив
-	for filename, content := range dp.files {
-		writer, err := zipWriter.Create(filename)
-		if err != nil {
-			return fmt.Errorf("ошибка создания файла %s в архиве: %v", filename, err)
-		}
-
-		_, err = writer.Write(content)
-		if err != nil {
-			return fmt.Errorf("ошибка записи файла %s: %v", filename, err)
-		}
-	}
-
-	return nil
-}
-
-// Закрытие процессора
-func (dp *DocxProcessor) Close() error {
-	if dp.zipReader != nil {
-		return dp.zipReader.Close()
-	}
-	return nil
-}
-
-// Пример использования
-func main() {
-	// Пример JSON данных
-	jsonData := `{
-		"client": {
-			"Name": "ООО Компания",
-			"Address": "г. Москва, ул. Примерная, д. 1"
-		},
-		"items": [
-			{
-				"Name": "Товар 1",
-				"Types": [
-					{
-						"Name": "Тип A",
-						"Price": 1000
-					},
-					{
-						"Name": "Тип B", 
-						"Price": 1500
-					}
-				]
-			},
-			{
-				"Name": "Товар 2",
-				"Types": [
-					{
-						"Name": "Тип C",
-						"Price": 2000
-					}
-				]
-			}
-		]
-	}`
-
-	// Создаем процессор
-	processor, err := NewDocxProcessor("template.docx")
-	if err != nil {
-		log.Fatalf("Ошибка создания процессора: %v", err)
-	}
-	defer processor.Close()
-
-	// Обрабатываем документ
-	err = processor.Process(jsonData, "output.docx")
-	if err != nil {
-		log.Fatalf("Ошибка обработки документа: %v", err)
-	}
-
-	fmt.Println("Документ успешно обработан и сохранен как output.docx")
-}
+			arrayName := part[:strings.Index(p
