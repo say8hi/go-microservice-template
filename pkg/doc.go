@@ -7,6 +7,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 )
@@ -424,6 +425,10 @@ func (dp *DocxProcessor) getValueFromMap(data map[string]interface{}, key string
 	return ""
 }
 
+func SaveDocx(data []byte, outputPath string) error {
+	return os.WriteFile(outputPath, data, 0644)
+}
+
 func main() {
 	jsonData := []byte(`{
 		"client": {
@@ -452,11 +457,22 @@ func main() {
 		panic(err)
 	}
 
+	// Способ 1: Получить байты и сохранить отдельно
 	result, err := processor.ProcessDocx("template.docx")
 	if err != nil {
 		panic(err)
 	}
 
-	// Сохранить result в файл
-	_ = result
+	err = SaveDocx(result, "output.docx")
+	if err != nil {
+		panic(err)
+	}
+
+	// Способ 2: Обработать и сохранить одной функцией
+	err = processor.ProcessDocxToFile("template.docx", "output2.docx")
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Файлы успешно созданы: output.docx и output2.docx")
 }
