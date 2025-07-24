@@ -75,25 +75,156 @@ func (dp *DocumentProcessor) ProcessWithJSON(jsonData string) error {
 
 	// Обрабатываем основной документ
 	if content, exists := dp.files["word/document.xml"]; exists {
-		processed, err := dp.processContent(string(content), data)
+		fmt.Println("Обрабатываем документ...")
+		
+		// Для отладки: сохраняем исходное содержимое
+		originalContent := string(content)
+		
+		processed, err := dp.processContent(originalContent, data)
 		if err != nil {
 			return err
 		}
+		
+		// Проверяем, были ли изменения
+		if processed == originalContent {
+			fmt.Println("ВНИМАНИЕ: Документ не был изменен. Возможно, плейсхолдеры не найдены.")
+			dp.debugPlaceholders(originalContent)
+		} else {
+			fmt.Println("Документ успешно обработан.")
+		}
+		
 		dp.files["word/document.xml"] = []byte(processed)
 	}
 
 	return nil
 }
 
+// debugPlaceholders выводит найденные плейсхолдеры для отладки
+func (dp *DocumentProcessor) debugPlaceholders(content string) {
+	fmt.Println("\n=== ОТЛАДКА ПЛЕЙСХОЛДЕРОВ ===")
+	
+	// Ищем потенциальные плейсхолдеры (даже разбитые)
+	openBrace := strings.Count(content, "{")
+	closeBrace := strings.Count(content, "}")
+	fmt.Printf("Найдено открывающих скобок: %d\n", openBrace)
+	fmt.Printf("Найдено закрывающих скобок: %d\n", closeBrace)
+	
+	// Ищем текстовые элементы, содержащие скобки
+	textWithBraces := regexp.MustCompile(`<w:t[^>]*>([^<]*[\{\}][^<]*)</w:t>`)
+	matches := textWithBraces.FindAllStringSubmatch(content, -1)
+	
+	if len(matches) > 0 {
+		fmt.Println("\nТекстовые элементы со скобками:")
+		for i, match := range matches {
+			if len(match) > 1 {
+				fmt.Printf("  %d: %s\n", i+1, match[1])
+			}
+		}
+	}
+	
+	// Пытаемся найти полные плейсхолдеры после нормализации
+	normalized := dp.fixBrokenPlaceholders(content)
+	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
+	placeholders := placeholderRegex.FindAllStringSubmatch(normalized, -1)
+	
+	if len(placeholders) > 0 {
+		fmt.Println("\nНайденные плейсхолдеры после нормализации:")
+		for i, placeholder := range placeholders {
+			if len(placeholder) > 1 {
+				fmt.Printf("  %d: {%s}\n", i+1, placeholder[1])
+			}
+		}
+	} else {
+		fmt.Println("\nПлейсхолдеры не найдены даже после нормализации.")
+		
+		// Показываем примеры текстовых элементов
+		allText := regexp.MustCompile(`<w:t[^>]*>([^<]+)</w:t>`)
+		textMatches := allText.FindAllStringSubmatch(content, -1)
+		fmt.Println("\nПервые 10 текстовых элементов:")
+		for i, match := range textMatches {
+			if i >= 10 {
+				break
+			}
+			if len(match) > 1 {
+				fmt.Printf("  %d: '%s'\n", i+1, match[1])
+			}
+		}
+	}
+	
+	fmt.Println("=== КОНЕЦ ОТЛАДКИ ===\n")
+}
+
 // processContent обрабатывает содержимое документа
 func (dp *DocumentProcessor) processContent(content string, data interface{}) (string, error) {
-	// Сначала обрабатываем таблицы
+	// Сначала нормализуем XML - собираем разбитые плейсхолдеры
+	content = dp.normalizePlaceholders(content)
+	
+	// Затем обрабатываем таблицы
 	content = dp.processTables(content, data)
 	
-	// Затем обрабатываем обычные плейсхолдеры
+	// Обрабатываем обычные плейсхолдеры
 	content = dp.processPlaceholders(content, data)
 	
 	return content, nil
+}
+
+// normalizePlaceholders собирает разбитые плейсхолдеры в DOCX XML
+func (dp *DocumentProcessor) normalizePlaceholders(content string) string {
+	// В DOCX плейсхолдеры могут быть разбиты между <w:t> элементами
+	// Например: <w:t>{client</w:t><w:t>.name}</w:t>
+	
+	// Сначала находим все текстовые элементы и временно заменяем их
+	textRegex := regexp.MustCompile(`<w:t[^>]*>([^<]*)</w:t>`)
+	textElements := textRegex.FindAllString(content, -1)
+	
+	// Создаем временную строку где объединяем весь текст
+	tempContent := content
+	placeholder := "___TEXT_PLACEHOLDER___"
+	
+	var allText strings.Builder
+	for i, element := range textElements {
+		textMatch := regexp.MustCompile(`<w:t[^>]*>([^<]*)</w:t>`).FindStringSubmatch(element)
+		if len(textMatch) > 1 {
+			allText.WriteString(textMatch[1])
+		}
+		tempContent = strings.Replace(tempContent, element, fmt.Sprintf("%s%d%s", placeholder, i, placeholder), 1)
+	}
+	
+	// Теперь ищем полные плейсхолдеры в объединенном тексте
+	combinedText := allText.String()
+	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
+	
+	// Если нашли полные плейсхолдеры, восстанавливаем структуру
+	if placeholderRegex.MatchString(combinedText) {
+		// Создаем новые текстовые элементы с исправленными плейсхолдерами
+		fixedText := combinedText
+		
+		// Разбиваем исправленный текст обратно на элементы
+		textParts := strings.Split(fixedText, "")
+		
+		// Простое решение: объединяем соседние текстовые элементы
+		result := content
+		
+		// Паттерн для поиска разбитых плейсхолдеров
+		brokenPlaceholderRegex := regexp.MustCompile(`(<w:t[^>]*>)([^<]*\{[^}]*)(</w:t>\s*<w:t[^>]*>)([^}]*\}[^<]*)(</w:t>)`)
+		
+		for brokenPlaceholderRegex.MatchString(result) {
+			result = brokenPlaceholderRegex.ReplaceAllStringFunc(result, func(match string) string {
+				// Извлекаем части
+				parts := brokenPlaceholderRegex.FindStringSubmatch(match)
+				if len(parts) == 6 {
+					// Объединяем текст в одном элементе
+					combinedText := parts[2] + parts[4]
+					return parts[1] + combinedText + parts[5]
+				}
+				return match
+			})
+		}
+		
+		return result
+	}
+	
+	return content
 }
 
 // processTables обрабатывает таблицы в документе
@@ -180,8 +311,11 @@ func (dp *DocumentProcessor) processTable(tableXML string, data interface{}) str
 	return processedTable
 }
 
-// findPlaceholders находит все плейсхолдеры в тексте
+// findPlaceholders находит все плейсхолдеры в тексте (с учетом разбитых в XML)
 func (dp *DocumentProcessor) findPlaceholders(text string) []string {
+	// Сначала исправляем разбитые плейсхолдеры
+	text = dp.fixBrokenPlaceholders(text)
+	
 	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
 	matches := placeholderRegex.FindAllStringSubmatch(text, -1)
 	
@@ -241,6 +375,9 @@ func (dp *DocumentProcessor) getMaxArrayLength(placeholders []string, data inter
 
 // processRowWithIndex обрабатывает строку таблицы с конкретным индексом массива
 func (dp *DocumentProcessor) processRowWithIndex(row string, data interface{}, index int) string {
+	// Сначала исправляем разбитые плейсхолдеры
+	row = dp.fixBrokenPlaceholders(row)
+	
 	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
 	
 	return placeholderRegex.ReplaceAllStringFunc(row, func(match string) string {
@@ -251,24 +388,96 @@ func (dp *DocumentProcessor) processRowWithIndex(row string, data interface{}, i
 		
 		if arr, ok := value.([]interface{}); ok {
 			if index < len(arr) {
-				return dp.valueToString(arr[index])
+				result := dp.valueToString(arr[index])
+				if result == "" && arr[index] == nil {
+					return fmt.Sprintf("[MISSING: %s[%d]]", placeholder, index)
+				}
+				return result
 			}
-			return ""
+			return fmt.Sprintf("[INDEX_OUT_OF_BOUNDS: %s[%d]]", placeholder, index)
 		}
 		
-		return dp.valueToString(value)
+		result := dp.valueToString(value)
+		if result == "" && value == nil {
+			return fmt.Sprintf("[MISSING: %s]", placeholder)
+		}
+		return result
 	})
 }
 
 // processPlaceholders обрабатывает обычные плейсхолдеры
 func (dp *DocumentProcessor) processPlaceholders(content string, data interface{}) string {
+	// Сначала нормализуем разбитые плейсхолдеры
+	content = dp.fixBrokenPlaceholders(content)
+	
 	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
 	
 	return placeholderRegex.ReplaceAllStringFunc(content, func(match string) string {
 		placeholder := strings.Trim(match, "{}")
 		value := dp.getNestedValue(data, placeholder)
-		return dp.valueToString(value)
+		result := dp.valueToString(value)
+		
+		// Если значение пустое, оставляем плейсхолдер для отладки
+		if result == "" && value == nil {
+			return fmt.Sprintf("[MISSING: %s]", placeholder)
+		}
+		
+		return result
 	})
+}
+
+// fixBrokenPlaceholders исправляет разбитые плейсхолдеры в XML
+func (dp *DocumentProcessor) fixBrokenPlaceholders(content string) string {
+	// Ищем паттерны типа: <w:t>{part1</w:t>...<w:t>part2}</w:t>
+	
+	// Простое решение: объединяем соседние <w:t> элементы если они содержат части плейсхолдера
+	for {
+		// Ищем открывающую скобку в одном элементе и закрывающую в другом
+		pattern := regexp.MustCompile(`(<w:t[^>]*>)([^<]*\{[^}]*)(<\/w:t>)\s*(<w:t[^>]*>)([^<]*\}[^<]*)(<\/w:t>)`)
+		
+		if !pattern.MatchString(content) {
+			break
+		}
+		
+		content = pattern.ReplaceAllStringFunc(content, func(match string) string {
+			parts := pattern.FindStringSubmatch(match)
+			if len(parts) == 7 {
+				// Объединяем содержимое в первом элементе
+				combinedContent := parts[2] + parts[5]
+				return parts[1] + combinedContent + parts[3]
+			}
+			return match
+		})
+	}
+	
+	// Также обрабатываем случаи с более чем двумя элементами
+	// Ищем последовательности <w:t> элементов, которые вместе образуют плейсхолдер
+	multiElementPattern := regexp.MustCompile(`(<w:t[^>]*>[^<]*\{[^}]*</w:t>)(\s*<w:t[^>]*>[^<]*</w:t>)*(\s*<w:t[^>]*>[^<]*\}[^<]*</w:t>)`)
+	
+	content = multiElementPattern.ReplaceAllStringFunc(content, func(match string) string {
+		// Извлекаем весь текст из всех <w:t> элементов в группе
+		textPattern := regexp.MustCompile(`<w:t[^>]*>([^<]*)</w:t>`)
+		textMatches := textPattern.FindAllStringSubmatch(match, -1)
+		
+		var fullText strings.Builder
+		for _, textMatch := range textMatches {
+			if len(textMatch) > 1 {
+				fullText.WriteString(textMatch[1])
+			}
+		}
+		
+		// Если полученный текст содержит полный плейсхолдер, создаем один элемент
+		combinedText := fullText.String()
+		if strings.Contains(combinedText, "{") && strings.Contains(combinedText, "}") {
+			// Берем структуру первого элемента и заменяем содержимое
+			firstElement := textMatches[0][0]
+			return regexp.MustCompile(`(<w:t[^>]*>)[^<]*(<\/w:t>)`).ReplaceAllString(firstElement, "${1}"+combinedText+"${2}")
+		}
+		
+		return match
+	})
+	
+	return content
 }
 
 // getNestedValue получает значение по вложенному пути (например, "client.name")
@@ -417,3 +626,8 @@ func main() {
   ]
 }
 */
+
+// Пример использования в DOCX:
+// Обычные плейсхолдеры: {client.name}, {client.address}
+// В таблице: {items.name} создаст строки для каждого элемента массива items
+// Вложенные массивы: {items.types.name}, {items.types.price} создадут строки для каждого типа
