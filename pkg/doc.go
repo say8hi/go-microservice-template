@@ -7,317 +7,172 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 )
 
-// DocumentProcessor обрабатывает DOCX документы
-type DocumentProcessor struct {
-	zipReader *zip.ReadCloser
-	files     map[string][]byte
+// WordDocument represents the main document structure
+type WordDocument struct {
+	XMLName xml.Name `xml:"document"`
+	Body    Body     `xml:"body"`
 }
 
-// TableRow представляет строку таблицы
-type TableRow struct {
-	Cells []string
+// Body represents the document body
+type Body struct {
+	XMLName    xml.Name    `xml:"body"`
+	Paragraphs []Paragraph `xml:"p"`
+	Tables     []Table     `xml:"tbl"`
 }
 
-// Table представляет таблицу в документе
+// Table represents a Word table
 type Table struct {
-	Rows []TableRow
+	XMLName xml.Name    `xml:"tbl"`
+	Rows    []TableRow  `xml:"tr"`
+	Props   interface{} `xml:"tblPr"`
 }
 
-// NewDocumentProcessor создает новый процессор документов
-func NewDocumentProcessor(filename string) (*DocumentProcessor, error) {
-	r, err := zip.OpenReader(filename)
-	if err != nil {
-		return nil, err
-	}
-
-	dp := &DocumentProcessor{
-		zipReader: r,
-		files:     make(map[string][]byte),
-	}
-
-	// Читаем все файлы из архива
-	for _, f := range r.File {
-		rc, err := f.Open()
-		if err != nil {
-			return nil, err
-		}
-		
-		content, err := io.ReadAll(rc)
-		if err != nil {
-			rc.Close()
-			return nil, err
-		}
-		rc.Close()
-		
-		dp.files[f.Name] = content
-	}
-
-	return dp, nil
+// TableRow represents a table row
+type TableRow struct {
+	XMLName xml.Name    `xml:"tr"`
+	Cells   []TableCell `xml:"tc"`
+	Props   interface{} `xml:"trPr"`
 }
 
-// Close закрывает процессор
-func (dp *DocumentProcessor) Close() error {
-	return dp.zipReader.Close()
+// TableCell represents a table cell
+type TableCell struct {
+	XMLName    xml.Name    `xml:"tc"`
+	Paragraphs []Paragraph `xml:"p"`
+	Props      interface{} `xml:"tcPr"`
 }
 
-// ProcessWithJSON обрабатывает документ с JSON данными
-func (dp *DocumentProcessor) ProcessWithJSON(jsonData string) error {
+// Paragraph represents a paragraph
+type Paragraph struct {
+	XMLName xml.Name `xml:"p"`
+	Runs    []Run    `xml:"r"`
+	Props   interface{} `xml:"pPr"`
+}
+
+// Run represents a text run
+type Run struct {
+	XMLName xml.Name `xml:"r"`
+	Texts   []Text   `xml:"t"`
+	Props   interface{} `xml:"rPr"`
+}
+
+// Text represents text content
+type Text struct {
+	XMLName xml.Name `xml:"t"`
+	Space   string   `xml:"space,attr,omitempty"`
+	Content string   `xml:",chardata"`
+}
+
+// PlaceholderProcessor handles placeholder replacement
+type PlaceholderProcessor struct {
+	data interface{}
+}
+
+// NewPlaceholderProcessor creates a new processor
+func NewPlaceholderProcessor(jsonData []byte) (*PlaceholderProcessor, error) {
 	var data interface{}
-	if err := json.Unmarshal([]byte(jsonData), &data); err != nil {
-		return fmt.Errorf("ошибка парсинга JSON: %v", err)
+	if err := json.Unmarshal(jsonData, &data); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %v", err)
 	}
+	
+	return &PlaceholderProcessor{data: data}, nil
+}
 
-	// Обрабатываем основной документ
-	if content, exists := dp.files["word/document.xml"]; exists {
-		fmt.Println("Обрабатываем документ...")
-		
-		// Для отладки: сохраняем исходное содержимое
-		originalContent := string(content)
-		
-		processed, err := dp.processContent(originalContent, data)
-		if err != nil {
+// ProcessDocument processes the entire document
+func (pp *PlaceholderProcessor) ProcessDocument(doc *WordDocument) error {
+	// Process paragraphs
+	for i := range doc.Body.Paragraphs {
+		if err := pp.processParagraph(&doc.Body.Paragraphs[i]); err != nil {
 			return err
 		}
-		
-		// Проверяем, были ли изменения
-		if processed == originalContent {
-			fmt.Println("ВНИМАНИЕ: Документ не был изменен. Возможно, плейсхолдеры не найдены.")
-			dp.debugPlaceholders(originalContent)
-		} else {
-			fmt.Println("Документ успешно обработан.")
-		}
-		
-		dp.files["word/document.xml"] = []byte(processed)
 	}
-
+	
+	// Process tables
+	for i := range doc.Body.Tables {
+		if err := pp.processTable(&doc.Body.Tables[i]); err != nil {
+			return err
+		}
+	}
+	
 	return nil
 }
 
-// debugPlaceholders выводит найденные плейсхолдеры для отладки
-func (dp *DocumentProcessor) debugPlaceholders(content string) {
-	fmt.Println("\n=== ОТЛАДКА ПЛЕЙСХОЛДЕРОВ ===")
-	
-	// Ищем потенциальные плейсхолдеры (даже разбитые)
-	openBrace := strings.Count(content, "{")
-	closeBrace := strings.Count(content, "}")
-	fmt.Printf("Найдено открывающих скобок: %d\n", openBrace)
-	fmt.Printf("Найдено закрывающих скобок: %d\n", closeBrace)
-	
-	// Ищем текстовые элементы, содержащие скобки
-	textWithBraces := regexp.MustCompile(`<w:t[^>]*>([^<]*[\{\}][^<]*)</w:t>`)
-	matches := textWithBraces.FindAllStringSubmatch(content, -1)
-	
-	if len(matches) > 0 {
-		fmt.Println("\nТекстовые элементы со скобками:")
-		for i, match := range matches {
-			if len(match) > 1 {
-				fmt.Printf("  %d: %s\n", i+1, match[1])
-			}
-		}
+// processTable handles table processing with array expansion
+func (pp *PlaceholderProcessor) processTable(table *Table) error {
+	if len(table.Rows) == 0 {
+		return nil
 	}
 	
-	// Пытаемся найти полные плейсхолдеры после нормализации
-	normalized := dp.fixBrokenPlaceholders(content)
-	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
-	placeholders := placeholderRegex.FindAllStringSubmatch(normalized, -1)
+	// Find placeholders in the first row to determine array expansions
+	arrayPlaceholders := pp.findArrayPlaceholders(table.Rows[0])
 	
-	if len(placeholders) > 0 {
-		fmt.Println("\nНайденные плейсхолдеры после нормализации:")
-		for i, placeholder := range placeholders {
-			if len(placeholder) > 1 {
-				fmt.Printf("  %d: {%s}\n", i+1, placeholder[1])
+	if len(arrayPlaceholders) == 0 {
+		// No arrays, process normally
+		for i := range table.Rows {
+			if err := pp.processTableRow(&table.Rows[i]); err != nil {
+				return err
 			}
 		}
-	} else {
-		fmt.Println("\nПлейсхолдеры не найдены даже после нормализации.")
-		
-		// Показываем примеры текстовых элементов
-		allText := regexp.MustCompile(`<w:t[^>]*>([^<]+)</w:t>`)
-		textMatches := allText.FindAllStringSubmatch(content, -1)
-		fmt.Println("\nПервые 10 текстовых элементов:")
-		for i, match := range textMatches {
-			if i >= 10 {
-				break
-			}
-			if len(match) > 1 {
-				fmt.Printf("  %d: '%s'\n", i+1, match[1])
-			}
-		}
+		return nil
 	}
 	
-	fmt.Println("=== КОНЕЦ ОТЛАДКИ ===\n")
+	// Expand rows based on arrays
+	return pp.expandTableRows(table, arrayPlaceholders)
 }
 
-// processContent обрабатывает содержимое документа
-func (dp *DocumentProcessor) processContent(content string, data interface{}) (string, error) {
-	// Сначала нормализуем XML - собираем разбитые плейсхолдеры
-	content = dp.normalizePlaceholders(content)
+// findArrayPlaceholders finds placeholders that reference arrays
+func (pp *PlaceholderProcessor) findArrayPlaceholders(row TableRow) map[int]string {
+	arrayPlaceholders := make(map[int]string)
 	
-	// Затем обрабатываем таблицы
-	content = dp.processTables(content, data)
-	
-	// Обрабатываем обычные плейсхолдеры
-	content = dp.processPlaceholders(content, data)
-	
-	return content, nil
-}
-
-// normalizePlaceholders собирает разбитые плейсхолдеры в DOCX XML
-func (dp *DocumentProcessor) normalizePlaceholders(content string) string {
-	// В DOCX плейсхолдеры могут быть разбиты между <w:t> элементами
-	// Например: <w:t>{client</w:t><w:t>.name}</w:t>
-	
-	// Сначала находим все текстовые элементы и временно заменяем их
-	textRegex := regexp.MustCompile(`<w:t[^>]*>([^<]*)</w:t>`)
-	textElements := textRegex.FindAllString(content, -1)
-	
-	// Создаем временную строку где объединяем весь текст
-	tempContent := content
-	placeholder := "___TEXT_PLACEHOLDER___"
-	
-	var allText strings.Builder
-	for i, element := range textElements {
-		textMatch := regexp.MustCompile(`<w:t[^>]*>([^<]*)</w:t>`).FindStringSubmatch(element)
-		if len(textMatch) > 1 {
-			allText.WriteString(textMatch[1])
-		}
-		tempContent = strings.Replace(tempContent, element, fmt.Sprintf("%s%d%s", placeholder, i, placeholder), 1)
-	}
-	
-	// Теперь ищем полные плейсхолдеры в объединенном тексте
-	combinedText := allText.String()
-	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
-	
-	// Если нашли полные плейсхолдеры, восстанавливаем структуру
-	if placeholderRegex.MatchString(combinedText) {
-		// Создаем новые текстовые элементы с исправленными плейсхолдерами
-		fixedText := combinedText
-		
-		// Разбиваем исправленный текст обратно на элементы
-		textParts := strings.Split(fixedText, "")
-		
-		// Простое решение: объединяем соседние текстовые элементы
-		result := content
-		
-		// Паттерн для поиска разбитых плейсхолдеров
-		brokenPlaceholderRegex := regexp.MustCompile(`(<w:t[^>]*>)([^<]*\{[^}]*)(</w:t>\s*<w:t[^>]*>)([^}]*\}[^<]*)(</w:t>)`)
-		
-		for brokenPlaceholderRegex.MatchString(result) {
-			result = brokenPlaceholderRegex.ReplaceAllStringFunc(result, func(match string) string {
-				// Извлекаем части
-				parts := brokenPlaceholderRegex.FindStringSubmatch(match)
-				if len(parts) == 6 {
-					// Объединяем текст в одном элементе
-					combinedText := parts[2] + parts[4]
-					return parts[1] + combinedText + parts[5]
-				}
-				return match
-			})
-		}
-		
-		return result
-	}
-	
-	return content
-}
-
-// processTables обрабатывает таблицы в документе
-func (dp *DocumentProcessor) processTables(content string, data interface{}) string {
-	// Находим все таблицы
-	tableRegex := regexp.MustCompile(`<w:tbl[^>]*>.*?</w:tbl>`)
-	tables := tableRegex.FindAllString(content, -1)
-	
-	for _, table := range tables {
-		processedTable := dp.processTable(table, data)
-		content = strings.Replace(content, table, processedTable, 1)
-	}
-	
-	return content
-}
-
-// processTable обрабатывает отдельную таблицу
-func (dp *DocumentProcessor) processTable(tableXML string, data interface{}) string {
-	// Находим все строки таблицы
-	rowRegex := regexp.MustCompile(`<w:tr[^>]*>.*?</w:tr>`)
-	rows := rowRegex.FindAllString(tableXML, -1)
-	
-	if len(rows) == 0 {
-		return tableXML
-	}
-	
-	var processedRows []string
-	headerProcessed := false
-	
-	for _, row := range rows {
-		// Находим плейсхолдеры в строке
-		placeholders := dp.findPlaceholders(row)
-		
-		if len(placeholders) == 0 || headerProcessed {
-			// Обычная строка без плейсхолдеров или заголовок уже обработан
-			processedRows = append(processedRows, dp.processPlaceholders(row, data))
-			headerProcessed = true
-			continue
-		}
-		
-		// Это строка с плейсхолдерами - нужно создать несколько строк
-		arrayPlaceholders := dp.findArrayPlaceholders(placeholders, data)
-		
-		if len(arrayPlaceholders) == 0 {
-			// Нет массивов, обрабатываем как обычную строку
-			processedRows = append(processedRows, dp.processPlaceholders(row, data))
-		} else {
-			// Есть массивы, создаем строки для каждого элемента
-			maxLength := dp.getMaxArrayLength(arrayPlaceholders, data)
-			
-			for i := 0; i < maxLength; i++ {
-				newRow := dp.processRowWithIndex(row, data, i)
-				processedRows = append(processedRows, newRow)
+	for cellIdx, cell := range row.Cells {
+		placeholders := pp.extractPlaceholdersFromCell(cell)
+		for _, placeholder := range placeholders {
+			if pp.isArrayPlaceholder(placeholder) {
+				arrayPlaceholders[cellIdx] = placeholder
 			}
 		}
-		headerProcessed = true
 	}
 	
-	// Собираем таблицу обратно
-	processedTable := tableXML
-	for i, originalRow := range rows {
-		if i < len(processedRows) {
-			processedTable = strings.Replace(processedTable, originalRow, processedRows[i], 1)
-		}
-	}
-	
-	// Если нужно добавить дополнительные строки
-	if len(processedRows) > len(rows) {
-		// Находим последнюю строку и добавляем после неё
-		lastRowIndex := strings.LastIndex(processedTable, "</w:tr>")
-		if lastRowIndex != -1 {
-			before := processedTable[:lastRowIndex+7]
-			after := processedTable[lastRowIndex+7:]
-			
-			additional := ""
-			for i := len(rows); i < len(processedRows); i++ {
-				additional += processedRows[i]
-			}
-			
-			processedTable = before + additional + after
-		}
-	}
-	
-	return processedTable
+	return arrayPlaceholders
 }
 
-// findPlaceholders находит все плейсхолдеры в тексте (с учетом разбитых в XML)
-func (dp *DocumentProcessor) findPlaceholders(text string) []string {
-	// Сначала исправляем разбитые плейсхолдеры
-	text = dp.fixBrokenPlaceholders(text)
+// extractPlaceholdersFromCell extracts all placeholders from a cell
+func (pp *PlaceholderProcessor) extractPlaceholdersFromCell(cell TableCell) []string {
+	var placeholders []string
 	
-	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
-	matches := placeholderRegex.FindAllStringSubmatch(text, -1)
+	for _, paragraph := range cell.Paragraphs {
+		text := pp.reconstructTextFromParagraph(paragraph)
+		found := pp.extractPlaceholders(text)
+		placeholders = append(placeholders, found...)
+	}
+	
+	return placeholders
+}
+
+// reconstructTextFromParagraph reconstructs text from paragraph runs
+func (pp *PlaceholderProcessor) reconstructTextFromParagraph(paragraph Paragraph) string {
+	var text strings.Builder
+	
+	for _, run := range paragraph.Runs {
+		for _, t := range run.Texts {
+			text.WriteString(t.Content)
+		}
+	}
+	
+	return text.String()
+}
+
+// extractPlaceholders extracts placeholders from text
+func (pp *PlaceholderProcessor) extractPlaceholders(text string) []string {
+	re := regexp.MustCompile(`\{([^}]+)\}`)
+	matches := re.FindAllStringSubmatch(text, -1)
 	
 	var placeholders []string
 	for _, match := range matches {
@@ -329,43 +184,64 @@ func (dp *DocumentProcessor) findPlaceholders(text string) []string {
 	return placeholders
 }
 
-// findArrayPlaceholders находит плейсхолдеры, которые ссылаются на массивы
-func (dp *DocumentProcessor) findArrayPlaceholders(placeholders []string, data interface{}) []string {
-	var arrayPlaceholders []string
-	
-	for _, placeholder := range placeholders {
-		if dp.isArrayPlaceholder(placeholder, data) {
-			arrayPlaceholders = append(arrayPlaceholders, placeholder)
-		}
-	}
-	
-	return arrayPlaceholders
-}
-
-// isArrayPlaceholder проверяет, является ли плейсхолдер ссылкой на массив
-func (dp *DocumentProcessor) isArrayPlaceholder(placeholder string, data interface{}) bool {
-	value := dp.getNestedValue(data, placeholder)
+// isArrayPlaceholder checks if a placeholder references an array
+func (pp *PlaceholderProcessor) isArrayPlaceholder(placeholder string) bool {
+	value := pp.getValueByPath(placeholder)
 	if value == nil {
 		return false
 	}
 	
-	switch v := value.(type) {
-	case []interface{}:
-		return len(v) > 0
-	default:
-		return false
-	}
+	v := reflect.ValueOf(value)
+	return v.Kind() == reflect.Slice || v.Kind() == reflect.Array
 }
 
-// getMaxArrayLength возвращает максимальную длину среди всех массивов в плейсхолдерах
-func (dp *DocumentProcessor) getMaxArrayLength(placeholders []string, data interface{}) int {
+// expandTableRows expands table rows based on array data
+func (pp *PlaceholderProcessor) expandTableRows(table *Table, arrayPlaceholders map[int]string) error {
+	if len(table.Rows) == 0 {
+		return nil
+	}
+	
+	templateRow := table.Rows[0]
+	var newRows []TableRow
+	
+	// Determine the maximum number of rows needed
+	maxRows := pp.getMaxArrayLength(arrayPlaceholders)
+	
+	for rowIdx := 0; rowIdx < maxRows; rowIdx++ {
+		newRow := pp.cloneTableRow(templateRow)
+		
+		// Process each cell with array context
+		for cellIdx, cell := range newRow.Cells {
+			if arrayPlaceholder, exists := arrayPlaceholders[cellIdx]; exists {
+				// This cell has an array placeholder
+				pp.processCellWithArrayIndex(&newRow.Cells[cellIdx], arrayPlaceholder, rowIdx)
+			} else {
+				// Regular cell processing
+				pp.processTableCell(&newRow.Cells[cellIdx])
+			}
+		}
+		
+		newRows = append(newRows, newRow)
+	}
+	
+	// Replace the original rows with expanded rows
+	table.Rows = append(newRows, table.Rows[1:]...)
+	
+	return nil
+}
+
+// getMaxArrayLength gets the maximum length among all arrays
+func (pp *PlaceholderProcessor) getMaxArrayLength(arrayPlaceholders map[int]string) int {
 	maxLength := 0
 	
-	for _, placeholder := range placeholders {
-		value := dp.getNestedValue(data, placeholder)
-		if arr, ok := value.([]interface{}); ok {
-			if len(arr) > maxLength {
-				maxLength = len(arr)
+	for _, placeholder := range arrayPlaceholders {
+		value := pp.getValueByPath(placeholder)
+		if value != nil {
+			v := reflect.ValueOf(value)
+			if v.Kind() == reflect.Slice || v.Kind() == reflect.Array {
+				if v.Len() > maxLength {
+					maxLength = v.Len()
+				}
 			}
 		}
 	}
@@ -373,133 +249,185 @@ func (dp *DocumentProcessor) getMaxArrayLength(placeholders []string, data inter
 	return maxLength
 }
 
-// processRowWithIndex обрабатывает строку таблицы с конкретным индексом массива
-func (dp *DocumentProcessor) processRowWithIndex(row string, data interface{}, index int) string {
-	// Сначала исправляем разбитые плейсхолдеры
-	row = dp.fixBrokenPlaceholders(row)
-	
-	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
-	
-	return placeholderRegex.ReplaceAllStringFunc(row, func(match string) string {
-		placeholder := strings.Trim(match, "{}")
-		
-		// Получаем значение
-		value := dp.getNestedValue(data, placeholder)
-		
-		if arr, ok := value.([]interface{}); ok {
-			if index < len(arr) {
-				result := dp.valueToString(arr[index])
-				if result == "" && arr[index] == nil {
-					return fmt.Sprintf("[MISSING: %s[%d]]", placeholder, index)
-				}
-				return result
-			}
-			return fmt.Sprintf("[INDEX_OUT_OF_BOUNDS: %s[%d]]", placeholder, index)
-		}
-		
-		result := dp.valueToString(value)
-		if result == "" && value == nil {
-			return fmt.Sprintf("[MISSING: %s]", placeholder)
-		}
-		return result
-	})
-}
-
-// processPlaceholders обрабатывает обычные плейсхолдеры
-func (dp *DocumentProcessor) processPlaceholders(content string, data interface{}) string {
-	// Сначала нормализуем разбитые плейсхолдеры
-	content = dp.fixBrokenPlaceholders(content)
-	
-	placeholderRegex := regexp.MustCompile(`\{([^}]+)\}`)
-	
-	return placeholderRegex.ReplaceAllStringFunc(content, func(match string) string {
-		placeholder := strings.Trim(match, "{}")
-		value := dp.getNestedValue(data, placeholder)
-		result := dp.valueToString(value)
-		
-		// Если значение пустое, оставляем плейсхолдер для отладки
-		if result == "" && value == nil {
-			return fmt.Sprintf("[MISSING: %s]", placeholder)
-		}
-		
-		return result
-	})
-}
-
-// fixBrokenPlaceholders исправляет разбитые плейсхолдеры в XML
-func (dp *DocumentProcessor) fixBrokenPlaceholders(content string) string {
-	// Ищем паттерны типа: <w:t>{part1</w:t>...<w:t>part2}</w:t>
-	
-	// Простое решение: объединяем соседние <w:t> элементы если они содержат части плейсхолдера
-	for {
-		// Ищем открывающую скобку в одном элементе и закрывающую в другом
-		pattern := regexp.MustCompile(`(<w:t[^>]*>)([^<]*\{[^}]*)(<\/w:t>)\s*(<w:t[^>]*>)([^<]*\}[^<]*)(<\/w:t>)`)
-		
-		if !pattern.MatchString(content) {
-			break
-		}
-		
-		content = pattern.ReplaceAllStringFunc(content, func(match string) string {
-			parts := pattern.FindStringSubmatch(match)
-			if len(parts) == 7 {
-				// Объединяем содержимое в первом элементе
-				combinedContent := parts[2] + parts[5]
-				return parts[1] + combinedContent + parts[3]
-			}
-			return match
-		})
+// cloneTableRow creates a deep copy of a table row
+func (pp *PlaceholderProcessor) cloneTableRow(row TableRow) TableRow {
+	newRow := TableRow{
+		XMLName: row.XMLName,
+		Props:   row.Props,
 	}
 	
-	// Также обрабатываем случаи с более чем двумя элементами
-	// Ищем последовательности <w:t> элементов, которые вместе образуют плейсхолдер
-	multiElementPattern := regexp.MustCompile(`(<w:t[^>]*>[^<]*\{[^}]*</w:t>)(\s*<w:t[^>]*>[^<]*</w:t>)*(\s*<w:t[^>]*>[^<]*\}[^<]*</w:t>)`)
-	
-	content = multiElementPattern.ReplaceAllStringFunc(content, func(match string) string {
-		// Извлекаем весь текст из всех <w:t> элементов в группе
-		textPattern := regexp.MustCompile(`<w:t[^>]*>([^<]*)</w:t>`)
-		textMatches := textPattern.FindAllStringSubmatch(match, -1)
-		
-		var fullText strings.Builder
-		for _, textMatch := range textMatches {
-			if len(textMatch) > 1 {
-				fullText.WriteString(textMatch[1])
-			}
+	for _, cell := range row.Cells {
+		newCell := TableCell{
+			XMLName: cell.XMLName,
+			Props:   cell.Props,
 		}
 		
-		// Если полученный текст содержит полный плейсхолдер, создаем один элемент
-		combinedText := fullText.String()
-		if strings.Contains(combinedText, "{") && strings.Contains(combinedText, "}") {
-			// Берем структуру первого элемента и заменяем содержимое
-			firstElement := textMatches[0][0]
-			return regexp.MustCompile(`(<w:t[^>]*>)[^<]*(<\/w:t>)`).ReplaceAllString(firstElement, "${1}"+combinedText+"${2}")
+		for _, paragraph := range cell.Paragraphs {
+			newParagraph := Paragraph{
+				XMLName: paragraph.XMLName,
+				Props:   paragraph.Props,
+			}
+			
+			for _, run := range paragraph.Runs {
+				newRun := Run{
+					XMLName: run.XMLName,
+					Props:   run.Props,
+				}
+				
+				for_, text := range run.Texts {
+					newRun.Texts = append(newRun.Texts, Text{
+						XMLName: text.XMLName,
+						Space:   text.Space,
+						Content: text.Content,
+					})
+				}
+				
+				newParagraph.Runs = append(newParagraph.Runs, newRun)
+			}
+			
+			newCell.Paragraphs = append(newCell.Paragraphs, newParagraph)
+		}
+		
+		newRow.Cells = append(newRow.Cells, newCell)
+	}
+	
+	return newRow
+}
+
+// processCellWithArrayIndex processes a cell with array index context
+func (pp *PlaceholderProcessor) processCellWithArrayIndex(cell *TableCell, arrayPlaceholder string, index int) {
+	for i := range cell.Paragraphs {
+		pp.processParagraphWithArrayIndex(&cell.Paragraphs[i], arrayPlaceholder, index)
+	}
+}
+
+// processParagraphWithArrayIndex processes a paragraph with array index context  
+func (pp *PlaceholderProcessor) processParagraphWithArrayIndex(paragraph *Paragraph, arrayPlaceholder string, index int) {
+	// Reconstruct and process text
+	fullText := pp.reconstructTextFromParagraph(*paragraph)
+	processedText := pp.replaceArrayPlaceholders(fullText, arrayPlaceholder, index)
+	
+	// Update the paragraph with processed text
+	pp.updateParagraphText(paragraph, processedText)
+}
+
+// replaceArrayPlaceholders replaces array placeholders with indexed values
+func (pp *PlaceholderProcessor) replaceArrayPlaceholders(text, arrayPlaceholder string, index int) string {
+	// Replace array placeholders
+	re := regexp.MustCompile(`\{` + regexp.QuoteMeta(arrayPlaceholder) + `(?:\.([^}]+))?\}`)
+	
+	result := re.ReplaceAllStringFunc(text, func(match string) string {
+		// Extract the full placeholder
+		placeholder := strings.Trim(match, "{}")
+		
+		// Get array value
+		arrayValue := pp.getValueByPath(arrayPlaceholder)
+		if arrayValue == nil {
+			return match
+		}
+		
+		v := reflect.ValueOf(arrayValue)
+		if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
+			return match
+		}
+		
+		if index >= v.Len() {
+			return ""
+		}
+		
+		itemValue := v.Index(index).Interface()
+		
+		// If it's just the array placeholder, return the item
+		if placeholder == arrayPlaceholder {
+			return pp.formatValue(itemValue)
+		}
+		
+		// If it has a sub-field, get that field
+		if strings.Contains(placeholder, ".") {
+			parts := strings.Split(placeholder, ".")
+			if len(parts) > 1 {
+				subPath := strings.Join(parts[1:], ".")
+				subValue := pp.getValueFromObject(itemValue, subPath)
+				return pp.formatValue(subValue)
+			}
 		}
 		
 		return match
 	})
 	
-	return content
+	// Replace other placeholders normally
+	return pp.replacePlaceholders(result)
 }
 
-// getNestedValue получает значение по вложенному пути (например, "client.name")
-func (dp *DocumentProcessor) getNestedValue(data interface{}, path string) interface{} {
+// processTableRow processes a table row
+func (pp *PlaceholderProcessor) processTableRow(row *TableRow) error {
+	for i := range row.Cells {
+		if err := pp.processTableCell(&row.Cells[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// processTableCell processes a table cell
+func (pp *PlaceholderProcessor) processTableCell(cell *TableCell) error {
+	for i := range cell.Paragraphs {
+		if err := pp.processParagraph(&cell.Paragraphs[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// processParagraph processes a paragraph
+func (pp *PlaceholderProcessor) processParagraph(paragraph *Paragraph) error {
+	// Reconstruct text from all runs
+	fullText := pp.reconstructTextFromParagraph(*paragraph)
+	
+	// Replace placeholders
+	processedText := pp.replacePlaceholders(fullText)
+	
+	// Update paragraph with processed text
+	pp.updateParagraphText(paragraph, processedText)
+	
+	return nil
+}
+
+// updateParagraphText updates paragraph with new text
+func (pp *PlaceholderProcessor) updateParagraphText(paragraph *Paragraph, newText string) {
+	// Clear existing runs and create a new one with the processed text
+	paragraph.Runs = []Run{
+		{
+			XMLName: xml.Name{Local: "r"},
+			Texts: []Text{
+				{
+					XMLName: xml.Name{Local: "t"},
+					Content: newText,
+					Space:   "preserve",
+				},
+			},
+		},
+	}
+}
+
+// replacePlaceholders replaces placeholders in text
+func (pp *PlaceholderProcessor) replacePlaceholders(text string) string {
+	re := regexp.MustCompile(`\{([^}]+)\}`)
+	
+	return re.ReplaceAllStringFunc(text, func(match string) string {
+		placeholder := strings.Trim(match, "{}")
+		value := pp.getValueByPath(placeholder)
+		return pp.formatValue(value)
+	})
+}
+
+// getValueByPath gets value by dot-separated path
+func (pp *PlaceholderProcessor) getValueByPath(path string) interface{} {
 	parts := strings.Split(path, ".")
-	current := data
+	current := pp.data
 	
 	for _, part := range parts {
-		switch v := current.(type) {
-		case map[string]interface{}:
-			current = v[part]
-		case []interface{}:
-			// Если это массив и часть - число, берем элемент по индексу
-			if index, err := strconv.Atoi(part); err == nil && index < len(v) {
-				current = v[index]
-			} else {
-				return nil
-			}
-		default:
-			return nil
-		}
-		
+		current = pp.getValueFromObject(current, part)
 		if current == nil {
 			return nil
 		}
@@ -508,126 +436,188 @@ func (dp *DocumentProcessor) getNestedValue(data interface{}, path string) inter
 	return current
 }
 
-// valueToString преобразует значение в строку
-func (dp *DocumentProcessor) valueToString(value interface{}) string {
+// getValueFromObject gets value from object by key
+func (pp *PlaceholderProcessor) getValueFromObject(obj interface{}, key string) interface{} {
+	if obj == nil {
+		return nil
+	}
+	
+	v := reflect.ValueOf(obj)
+	
+	// Handle interface{} and pointers
+	for v.Kind() == reflect.Interface || v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	
+	switch v.Kind() {
+	case reflect.Map:
+		mapValue := v.MapIndex(reflect.ValueOf(key))
+		if !mapValue.IsValid() {
+			return nil
+		}
+		return mapValue.Interface()
+		
+	case reflect.Struct:
+		field := v.FieldByName(key)
+		if !field.IsValid() {
+			return nil
+		}
+		return field.Interface()
+		
+	default:
+		return nil
+	}
+}
+
+// formatValue formats a value for display
+func (pp *PlaceholderProcessor) formatValue(value interface{}) string {
 	if value == nil {
 		return ""
 	}
 	
-	switch v := value.(type) {
-	case string:
-		return v
-	case float64:
-		if v == float64(int64(v)) {
-			return strconv.FormatInt(int64(v), 10)
-		}
-		return strconv.FormatFloat(v, 'f', -1, 64)
-	case bool:
-		if v {
-			return "true"
-		}
-		return "false"
+	v := reflect.ValueOf(value)
+	
+	switch v.Kind() {
+	case reflect.String:
+		return v.String()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return strconv.FormatInt(v.Int(), 10)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return strconv.FormatUint(v.Uint(), 10)
+	case reflect.Float32, reflect.Float64:
+		return strconv.FormatFloat(v.Float(), 'f', -1, 64)
+	case reflect.Bool:
+		return strconv.FormatBool(v.Bool())
 	default:
-		return fmt.Sprintf("%v", v)
+		return fmt.Sprintf("%v", value)
 	}
 }
 
-// SaveAs сохраняет обработанный документ
-func (dp *DocumentProcessor) SaveAs(filename string) error {
-	file, err := os.Create(filename)
+// ProcessDocxFile processes a DOCX file
+func ProcessDocxFile(inputPath, outputPath string, jsonData []byte) error {
+	// Open the DOCX file
+	reader, err := zip.OpenReader(inputPath)
+	if err != nil {
+		return fmt.Errorf("failed to open DOCX file: %v", err)
+	}
+	defer reader.Close()
+	
+	// Create output buffer
+	var outputBuffer bytes.Buffer
+	writer := zip.NewWriter(&outputBuffer)
+	defer writer.Close()
+	
+	// Create processor
+	processor, err := NewPlaceholderProcessor(jsonData)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 	
-	zipWriter := zip.NewWriter(file)
-	defer zipWriter.Close()
-	
-	// Записываем все файлы в новый архив
-	for name, content := range dp.files {
-		writer, err := zipWriter.Create(name)
-		if err != nil {
-			return err
-		}
-		
-		_, err = writer.Write(content)
-		if err != nil {
-			return err
+	// Process each file in the DOCX
+	for _, file := range reader.File {
+		if file.Name == "word/document.xml" {
+			// Process the main document
+			if err := processDocumentXML(file, writer, processor); err != nil {
+				return err
+			}
+		} else {
+			// Copy other files as-is
+			if err := copyFile(file, writer); err != nil {
+				return err
+			}
 		}
 	}
 	
-	return nil
+	writer.Close()
+	
+	// Write output file
+	return os.WriteFile(outputPath, outputBuffer.Bytes(), 0644)
 }
 
-// Пример использования
+// processDocumentXML processes the main document XML
+func processDocumentXML(file *zip.File, writer *zip.Writer, processor *PlaceholderProcessor) error {
+	// Read the document XML
+	rc, err := file.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	
+	content, err := io.ReadAll(rc)
+	if err != nil {
+		return err
+	}
+	
+	// Parse XML
+	var doc WordDocument
+	if err := xml.Unmarshal(content, &doc); err != nil {
+		return fmt.Errorf("failed to parse document XML: %v", err)
+	}
+	
+	// Process placeholders
+	if err := processor.ProcessDocument(&doc); err != nil {
+		return err
+	}
+	
+	// Marshal back to XML
+	output, err := xml.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	
+	// Add XML header
+	xmlContent := xml.Header + string(output)
+	
+	// Write to output
+	w, err := writer.Create(file.Name)
+	if err != nil {
+		return err
+	}
+	
+	_, err = w.Write([]byte(xmlContent))
+	return err
+}
+
+// copyFile copies a file from input to output zip
+func copyFile(file *zip.File, writer *zip.Writer) error {
+	// Create file in output zip
+	w, err := writer.Create(file.Name)
+	if err != nil {
+		return err
+	}
+	
+	// Open source file
+	rc, err := file.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	
+	// Copy content
+	_, err = io.Copy(w, rc)
+	return err
+}
+
 func main() {
 	if len(os.Args) < 4 {
-		fmt.Println("Использование: program <input.docx> <data.json> <output.docx>")
+		fmt.Println("Usage: go run main.go <input.docx> <output.docx> <data.json>")
 		os.Exit(1)
 	}
 	
-	inputFile := os.Args[1]
-	dataFile := os.Args[2]
-	outputFile := os.Args[3]
+	inputPath := os.Args[1]
+	outputPath := os.Args[2]
+	jsonPath := os.Args[3]
 	
-	// Читаем JSON данные
-	jsonData, err := os.ReadFile(dataFile)
+	// Read JSON data
+	jsonData, err := os.ReadFile(jsonPath)
 	if err != nil {
-		fmt.Printf("Ошибка чтения JSON файла: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("Failed to read JSON file: %v", err)
 	}
 	
-	// Создаем процессор документов
-	processor, err := NewDocumentProcessor(inputFile)
-	if err != nil {
-		fmt.Printf("Ошибка открытия DOCX файла: %v\n", err)
-		os.Exit(1)
-	}
-	defer processor.Close()
-	
-	// Обрабатываем документ
-	err = processor.ProcessWithJSON(string(jsonData))
-	if err != nil {
-		fmt.Printf("Ошибка обработки документа: %v\n", err)
-		os.Exit(1)
+	// Process DOCX file
+	if err := ProcessDocxFile(inputPath, outputPath, jsonData); err != nil {
+		log.Fatalf("Failed to process DOCX file: %v", err)
 	}
 	
-	// Сохраняем результат
-	err = processor.SaveAs(outputFile)
-	if err != nil {
-		fmt.Printf("Ошибка сохранения файла: %v\n", err)
-		os.Exit(1)
-	}
-	
-	fmt.Println("Документ успешно обработан!")
+	fmt.Printf("Successfully processed %s -> %s\n", inputPath, outputPath)
 }
-
-// Пример JSON структуры:
-/*
-{
-  "client": {
-    "name": "ООО Пример",
-    "address": "г. Москва, ул. Примерная, д. 1"
-  },
-  "items": [
-    {
-      "name": "Товар 1",
-      "types": [
-        {"name": "Тип A", "price": 100},
-        {"name": "Тип B", "price": 150}
-      ]
-    },
-    {
-      "name": "Товар 2", 
-      "types": [
-        {"name": "Тип C", "price": 200}
-      ]
-    }
-  ]
-}
-*/
-
-// Пример использования в DOCX:
-// Обычные плейсхолдеры: {client.name}, {client.address}
-// В таблице: {items.name} создаст строки для каждого элемента массива items
-// Вложенные массивы: {items.types.name}, {items.types.price} создадут строки для каждого типа
