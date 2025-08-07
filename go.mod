@@ -1,4 +1,4 @@
-module api-template
+module microservice-template
 
 go 1.24.2
 
