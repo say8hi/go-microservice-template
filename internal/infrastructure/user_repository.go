@@ -1,10 +1,10 @@
-package repository
+package infrastructure
 
 import (
 	"context"
 	"errors"
-	"sync"
 	"microservice-template/internal/domain"
+	"sync"
 )
 
 type userRepository struct {

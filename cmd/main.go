@@ -4,8 +4,8 @@ import (
 	"context"
 	"microservice-template/config"
 	"microservice-template/internal/handler"
+	"microservice-template/internal/infrastructure"
 	"microservice-template/internal/middleware"
-	"microservice-template/internal/repository"
 	"microservice-template/internal/usecase"
 	"microservice-template/pkg/logger"
 	"net/http"
@@ -23,7 +23,7 @@ func main() {
 	log := logger.NewLogger(cfg.LogLevel, true, "logs/")
 
 	// Initialize layers
-	userRepo := repository.NewUserRepository()
+	userRepo := infrastructure.NewUserRepository()
 	userService := usecase.NewUserService(userRepo, log)
 	userHandler := handler.NewUserHandler(userService, log)
 
