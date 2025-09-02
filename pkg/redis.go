@@ -1,109 +1,99 @@
-type DataService struct {
-	rdb                *redis.Client
-	updateStatusScript string
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/redis/go-redis/v9"
+)
+
+var ctx = context.Background()
+
+// Lua script
+const updateScript = `
+local obj = redis.call("HGET", KEYS[1], ARGV[1])
+local data = {}
+local cjson = cjson
+
+if obj then
+    data = cjson.decode(obj)
+else
+    data = {}
+end
+
+local alreadySet = data[ARGV[2]] ~= nil
+
+if ARGV[3] == "true" then
+    data[ARGV[2]] = true
+else
+    data[ARGV[2]] = false
+end
+
+redis.call("HSET", KEYS[1], ARGV[1], cjson.encode(data))
+
+if not alreadySet then
+    if data["statusFee"] ~= nil and data["statusNDP"] ~= nil then
+        local left = redis.call("DECR", KEYS[2])
+        return left
+    end
+end
+
+return redis.call("GET", KEYS[2])
+`
+
+func updateStatus(
+	rdb *redis.Client,
+	reqID string,
+	objectID string,
+	statusType string,
+	value bool,
+) (int64, error) {
+	script := redis.NewScript(updateScript)
+	keyObjects := fmt.Sprintf("req:%s:objects", reqID)
+	keyRemaining := fmt.Sprintf("req:%s:remaining", reqID)
+
+	val := "false"
+	if value {
+		val = "true"
+	}
+
+	res, err := script.Run(ctx, rdb, []string{keyObjects, keyRemaining}, objectID, statusType, val).
+		Result()
+	if err != nil {
+		return -1, err
+	}
+
+	// Lua возвращает строку или число, приводим к int64
+	switch v := res.(type) {
+	case int64:
+		return v, nil
+	case string:
+		// redis возвращает строку для GET
+		var n int64
+		fmt.Sscan(v, &n)
+		return n, nil
+	default:
+		return -1, fmt.Errorf("unexpected return type %T", v)
+	}
 }
 
-type BatchData struct {
-	RequestID string     `json:"request_id"`
-	UserID    string     `json:"user_id"`
-	Items     []DataItem `json:"items"`
-}
+func main() {
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
 
-type DataItem struct {
-	ID           string                 `json:"id"`
-	OriginalData map[string]interface{} `json:"original_data"`
-	EnrichedData map[string]interface{} `json:"enriched_data"`
-}
+	reqID := "123"
 
-func (ds *DataService) SaveBatchData(ctx context.Context, data BatchData) error {
-	// 1. Метаданные
-	metadata := map[string]interface{}{
-		"total_items":     len(data.Items),
-		"completed_items": 0,
-		"status":          "processing",
-		"user_id":         data.UserID,
-		"created_at":      time.Now().Unix(),
-	}
-
-	err := ds.rdb.HMSet(ctx, data.RequestID+":metadata", metadata).Err()
+	// пример: объект 0 получает коллбэк по statusFee
+	left, err := updateStatus(rdb, reqID, "0", "statusFee", true)
 	if err != nil {
-		return err
+		panic(err)
 	}
+	fmt.Println("Remaining:", left)
 
-	// 2. Элементы
-	itemsJSON, _ := json.Marshal(data.Items)
-	err = ds.rdb.Set(ctx, data.RequestID+":items", itemsJSON, time.Hour).Err()
+	// пример: объект 0 получает коллбэк по statusNDP
+	left, err = updateStatus(rdb, reqID, "0", "statusNDP", false)
 	if err != nil {
-		return err
+		panic(err)
 	}
-
-	// 3. Статусы
-	statuses := make(map[string]interface{})
-	for _, item := range data.Items {
-		statuses[item.ID] = "pending"
-	}
-
-	err = ds.rdb.HMSet(ctx, data.RequestID+":statuses", statuses).Err()
-	if err != nil {
-		return err
-	}
-
-	// 4. TTL
-	ds.rdb.Expire(ctx, data.RequestID+":metadata", time.Hour)
-	ds.rdb.Expire(ctx, data.RequestID+":statuses", time.Hour)
-
-	return nil
-}
-
-func (ds *DataService) UpdateItemStatus(ctx context.Context, reqID, itemID, status string) (string, error) {
-	// Lua-скрипт для атомарного обновления
-	result, err := ds.rdb.Eval(ctx, ds.updateStatusScript, []string{reqID}, itemID, status).Result()
-	if err != nil {
-		return "", err
-	}
-
-	if result == nil {
-		return "", nil // Еще не все завершено
-	}
-
-	return result.(string), nil // userID - все завершено
-}
-
-func (ds *DataService) GetBatchData(ctx context.Context, reqID string) (*BatchResponse, error) {
-	metadata, err := ds.rdb.HGetAll(ctx, reqID+":metadata").Result()
-	if err != nil || len(metadata) == 0 {
-		return nil, errors.New("request not found")
-	}
-
-	itemsRaw, err := ds.rdb.Get(ctx, reqID+":items").Result()
-	if err != nil {
-		return nil, err
-	}
-
-	statuses, err := ds.rdb.HGetAll(ctx, reqID+":statuses").Result()
-	if err != nil {
-		return nil, err
-	}
-
-	var items []DataItem
-	json.Unmarshal([]byte(itemsRaw), &items)
-
-	// Объединяем статусы с элементами
-	for i := range items {
-		items[i].Status = statuses[items[i].ID]
-	}
-
-	totalItems, _ := strconv.Atoi(metadata["total_items"])
-	completedItems, _ := strconv.Atoi(metadata["completed_items"])
-
-	return &BatchResponse{
-		RequestID: reqID,
-		Metadata: BatchMetadata{
-			TotalItems:     totalItems,
-			CompletedItems: completedItems,
-			Status:         metadata["status"],
-			UserID:         metadata["user_id"],
-		},
-		Items: items,
-	}, nil
-}
+	fmt.Println("Remaining:", left)
