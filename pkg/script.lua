@@ -1,19 +1,41 @@
-redis.call('HSET', KEYS[1] .. ':statuses', ARGV[1], ARGV[2])
+-- KEYS[1] = req:{reqID}:objects
+-- KEYS[2] = req:{reqID}:remaining
+-- ARGV[1] = field (индекс объекта)
+-- ARGV[2] = statusType
+-- ARGV[3] = новое значение ("true"/"false")
 
-local completed = 0
-local statuses = redis.call('HGETALL', KEYS[1] .. ':statuses')
-for i = 2, #statuses, 2 do
-    if statuses[i] ~= 'pending' then
-        completed = completed + 1
-    end
+local objectsKey = KEYS[1]
+local remainingKey = KEYS[2]
+local field = ARGV[1]
+local statusType = ARGV[2]
+local value = ARGV[3]
+
+-- читаем JSON объекта
+local data = redis.call("HGET", objectsKey, field)
+if not data then
+  return nil
 end
 
-redis.call('HSET', KEYS[1] .. ':metadata', 'completed_items', completed)
+local obj = cjson.decode(data)
 
--- Проверяем завершение всех элементов
-local total = tonumber(redis.call('HGET', KEYS[1] .. ':metadata', 'total_items'))
-if completed >= total then
-    redis.call('HSET', KEYS[1] .. ':metadata', 'status', 'completed')
-    return redis.call('HGET', KEYS[1] .. ':metadata', 'user_id')
+-- проверяем старое значение
+local oldValue = obj[statusType]
+
+-- обновляем только одно поле
+if value == "true" then
+    obj[statusType] = true
+else
+    obj[statusType] = false
 end
-return nil
+
+-- если старое значение было nil или false, а новое true → уменьшаем remaining
+if (not oldValue or oldValue == false) and obj[statusType] == true then
+    redis.call("DECR", remainingKey)
+end
+
+-- сохраняем обратно
+local newData = cjson.encode(obj)
+redis.call("HSET", objectsKey, field, newData)
+
+return newData
+
